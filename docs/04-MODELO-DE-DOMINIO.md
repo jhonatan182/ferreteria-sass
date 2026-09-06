@@ -2043,3 +2043,90 @@ Después de validar los flujos podremos elaborar:
 ```
 
 y finalmente pasar al diseño físico de PostgreSQL/Prisma.
+
+---
+
+# 44. Apéndice — Decisiones de implementación (Fase 2: fundación SaaS e identidad)
+
+Esta fase materializó en `prisma/schema.prisma` las 14 entidades del bloque
+SaaS de la sección 39 (`User`, `Tenant`, `TenantMembership`, `Role`,
+`Permission`, `RolePermission`, `Plan`, `Feature`, `PlanFeature`, `PlanLimit`,
+`Subscription`, `SubscriptionPeriod`, `SaaSPayment`, `PlatformAuditLog`) más el
+seed inicial. Se registran aquí las decisiones que la documentación no cerraba,
+para que código y documentación no diverjan (AGENTS.md 28, RN-101).
+
+## 44.1 Decisiones sobre puntos abiertos
+
+1. **Platform Admin** — se modela como `User.isPlatformAdmin: boolean`
+   (`@default(false)`). No es un rol de tenant. Un Platform Admin no tiene
+   `TenantMembership`, por lo que RP-008 (sin acceso automático a datos de
+   tenant) se cumple estructuralmente. Si en el futuro se requiere soporte
+   temporal a un tenant, será un mecanismo explícito y auditable aparte, nunca
+   una puerta trasera.
+
+2. **`Role` en el seed** — `Role.tenantId` es `NOT NULL` (fiel a la sección
+   6.1). El mapeo rol → permisos vive en código
+   (`apps/api/src/authz/role-templates.ts`) como fuente única para el seed y el
+   futuro provisioning de tenants. El seed crea un tenant de desarrollo con sus
+   5 roles `isSystem = true`.
+
+3. **Contraseña del Platform Admin** — `User.passwordHash` es opcional
+   (`String?`). El seed crea usuarios sin credencial. El algoritmo de hash y el
+   establecimiento de la credencial son responsabilidad de la fase de
+   autenticación.
+
+4. **Grace period y moneda del plan** — `Plan.gracePeriodDays: Int @default(7)`
+   y `Plan.currency: Char(3) @default("HNL")`. Configurable por plan es un
+   superset de "configurable a nivel de plataforma" (docs/00 286-288) sin
+   introducir una entidad de configuración global.
+
+5. **Moneda y zona horaria del tenant** — `Tenant.baseCurrency: Char(3)
+   @default("HNL")` y `Tenant.timezone: String @default("America/Tegucigalpa")`,
+   exigidos por docs/07 756-772 aunque no aparezcan en la lista de atributos de
+   la sección 5.1. `Tenant.baseCurrency` (moneda del negocio) es distinta de
+   `Plan.currency` (moneda con que la plataforma cobra la suscripción).
+
+6. **Estado de `SubscriptionPeriod`** — enum `PENDING | PAID | CANCELLED`
+   (RN-090 exige un estado pero no enumera valores). Es el mínimo que soporta el
+   ciclo RF-155/156/157.
+
+7. **Nombres físicos** — tablas y columnas en `snake_case` vía `@@map`/`@map`
+   (la documentación no fijaba convención). Los modelos y campos Prisma siguen
+   en inglés PascalCase/camelCase según la sección 38.
+
+8. **Suscripción vigente única por tenant** — índice único parcial en Postgres
+   `subscription_one_active_per_tenant ON subscriptions (tenant_id) WHERE status
+   IN ('ACTIVE','PAST_DUE')` (añadido a mano en la migración; no expresable en
+   Prisma). Permite crear una suscripción nueva tras `CANCELLED`/`SUSPENDED`.
+
+9. **`Plan.code`** — existe para identidad estable en seeds y migraciones.
+   Queda **prohibido** ramificar lógica por `code` o `name` (AGENTS.md 19); el
+   acceso funcional se resuelve por `Feature` y `PlanLimit`.
+
+## 44.2 Inconsistencias detectadas en la documentación
+
+Se señalan sin perpetuarlas (RN-101). El catálogo sembrado son exactamente los
+70 permisos de docs/03 secciones 13-25.
+
+- **`roles.manage`** aparece en docs/03 352 y 395 como permiso negado a CASHIER
+  e INVENTORY_MANAGER, pero no existe en el catálogo formal de docs/03 611-618
+  (que define `roles.manage_permissions`). Se interpreta como abreviatura
+  informal; **no se siembra**.
+- **`products.delete`** aparece en docs/03 337 como negado a CASHIER, pero no
+  existe en docs/03 477-487 — coherente con la política de no borrado físico.
+  **No se siembra**.
+- **RF-113** (docs/06 498-500) exige un permiso para exceder el límite de
+  crédito pero no da su código. Créditos está fuera de esta fase; queda
+  pendiente, no se inventa el código.
+
+## 44.3 Pendientes soportados por el modelo, no implementados en esta fase
+
+- Job programado `ACTIVE → PAST_DUE → SUSPENDED` (docs/07 735-751, idempotente).
+  El índice `subscriptions(status, current_period_end)` y
+  `Subscription.gracePeriodEndsAt` existen para él.
+- Entidad de configuración/numeración del tenant (docs/05 220-230). Los permisos
+  `tenant.settings.*` ya se siembran; la entidad no está en la lista V1 de la
+  sección 39.
+- Política de escala y redondeo decimal (sección 28). El dinero SaaS usa
+  `Decimal(12,2)`, suficiente y sin prejuzgar la escala del dominio operativo.
+- Autenticación: no se implementa nada en esta fase.

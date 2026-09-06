@@ -48,12 +48,20 @@ Gestor: **pnpm workspaces** (`pnpm-workspace.yaml`).
 apps/
   web/    Next.js (App Router) + TypeScript + Tailwind + shadcn/ui   -> @ferreteria/web
   api/    NestJS + TypeScript (ESM) + Prisma                         -> @ferreteria/api
+  api/src/authz/  catálogo de permisos, plantillas de roles de sistema,
+                  códigos de features y claves de límites (consumido por
+                  el seed y, después, por guards y provisioning de tenants)
 packages/
   config/      tsconfig / prettier / oxlint compartidos             -> @ferreteria/config
   types/       contratos de tipos, sin runtime                      -> @ferreteria/types
   validation/  esquemas zod runtime (uuid, dinero, cantidad, ...)    -> @ferreteria/validation
 prisma/
-  schema.prisma   solo datasource + generator (sin modelos todavía)
+  schema.prisma   fundación SaaS e identidad (14 modelos): User, Tenant,
+                  TenantMembership, Role, Permission, RolePermission, Plan,
+                  Feature, PlanFeature, PlanLimit, Subscription,
+                  SubscriptionPeriod, SaaSPayment, PlatformAuditLog
+  seed.ts         catálogo de plataforma (todo entorno) + datos de desarrollo
+  migrations/     migraciones versionadas
 prisma.config.ts  configuración del CLI de Prisma 7 (la conexión de PrismaClient
                   usa un driver adapter en apps/api/src/prisma/prisma.service.ts)
 docker-compose.yml   PostgreSQL 16 para desarrollo
@@ -72,11 +80,12 @@ Desde la raíz:
 
 ```bash
 pnpm install          # instala todo el workspace (+ prisma generate)
-cp .env.example .env   # y completar AUTH_SECRET
+cp .env.example .env   # completar AUTH_SECRET y las variables de seed (PLATFORM_ADMIN_*, DEV_TENANT_*)
 
 pnpm db:up            # PostgreSQL (Docker)   -> localhost:5433
 pnpm db:generate      # regenerar cliente Prisma
-pnpm db:migrate       # crear/aplicar migración (cuando existan modelos)
+pnpm db:migrate       # crear/aplicar migración
+pnpm db:seed          # sembrar permisos, features, plan/tenant de desarrollo (idempotente)
 pnpm db:studio        # Prisma Studio
 pnpm db:down          # apagar PostgreSQL
 

@@ -1,14 +1,24 @@
-// Esquema Prisma — base tecnica.
+// Esquema Prisma — Fase 2: Fundacion SaaS e Identidad.
 //
-// En esta fase SOLO se define datasource + generator.
-// El modelo de dominio (Tenant, User, Product, Inventory, Sales, ...) se
-// agrega en fases posteriores, cada cambio con su migracion (AGENTS.md 22).
+// Alcance de esta fase (docs/04-MODELO-DE-DOMINIO.md 1771-1791):
+//   Identidad:  User, Tenant, TenantMembership, Role, Permission, RolePermission
+//   Plataforma: Plan, Feature, PlanFeature, PlanLimit,
+//               Subscription, SubscriptionPeriod, SaaSPayment, PlatformAuditLog
 //
-// Reglas al modelar (docs/07-ARQUITECTURA-TECNICA.md 10-13):
+// Fuera de alcance (fases posteriores, cada una con su migracion — AGENTS.md 22):
+//   autenticacion, productos, inventario, compras, ventas, caja, creditos,
+//   reportes, AuditLog operativo.
+//
+// Reglas al modelar (docs/07-ARQUITECTURA-TECNICA.md 10-13, 233-257):
 //   - IDs = UUID
-//   - dinero y cantidades fraccionables = Decimal, nunca Float
+//   - dinero = Decimal, nunca Float (AGENTS.md 11)
 //   - relaciones explicitas e indices tenant-aware
 //   - unicidad compuesta por tenant cuando corresponda
+//   - timestamps createdAt/updatedAt salvo en logs append-only
+//
+// Convencion de nombres fisicos: snake_case plural via @@map / @map
+// (la documentacion no la fija; se elige por legibilidad del SQL crudo,
+//  que aun se necesita para el indice parcial de Subscription — ver abajo).
 
 generator client {
   provider     = "prisma-client"
@@ -18,4 +28,383 @@ generator client {
 
 datasource db {
   provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+
+  @@map("user_status")
+}
+
+enum TenantStatus {
+  ACTIVE
+  SUSPENDED
+
+  @@map("tenant_status")
+}
+
+enum MembershipStatus {
+  ACTIVE
+  INACTIVE
+
+  @@map("membership_status")
+}
+
+// docs/00-DISENO-SAAS.md 259-266, docs/04 412-419, AGENTS.md 249-257.
+enum SubscriptionStatus {
+  ACTIVE
+  PAST_DUE
+  SUSPENDED
+  CANCELLED
+
+  @@map("subscription_status")
+}
+
+// RN-090 exige un estado por periodo pero la doc no enumera valores.
+// Minimo que cubre el ciclo RF-155/156/157.
+enum SubscriptionPeriodStatus {
+  PENDING
+  PAID
+  CANCELLED
+
+  @@map("subscription_period_status")
+}
+
+enum BillingInterval {
+  MONTHLY
+  YEARLY
+
+  @@map("billing_interval")
+}
+
+// ---------------------------------------------------------------------------
+// Identidad
+// ---------------------------------------------------------------------------
+
+/// Persona que puede autenticarse en la plataforma (docs/04 107-135).
+/// GLOBAL: no pertenece a un tenant; la relacion se da via TenantMembership.
+model User {
+  id              String     @id @default(uuid()) @db.Uuid
+  name            String
+  email           String
+  /// Nullable en esta fase: la autenticacion (algoritmo de hash) se define
+  /// en la fase siguiente. El seed crea usuarios sin credencial.
+  passwordHash    String?    @map("password_hash")
+  status          UserStatus @default(ACTIVE)
+  /// Administrador de la plataforma SaaS (docs/03 123-167, RN-097).
+  /// No es un rol de tenant. Un platform admin no tiene TenantMembership,
+  /// por lo que RP-008 (sin acceso automatico al tenant) se cumple de raiz.
+  isPlatformAdmin Boolean    @default(false) @map("is_platform_admin")
+  lastLoginAt     DateTime?  @map("last_login_at")
+  createdAt       DateTime   @default(now()) @map("created_at")
+  updatedAt       DateTime   @updatedAt @map("updated_at")
+
+  memberships          TenantMembership[]
+  saasPaymentsRecorded SaaSPayment[]      @relation("SaaSPaymentRecordedBy")
+  platformAuditLogs    PlatformAuditLog[] @relation("PlatformAuditActor")
+
+  @@unique([email])
+  @@index([status])
+  @@index([isPlatformAdmin])
+  @@map("users")
+}
+
+/// Una ferreteria / empresa cliente (docs/04 186-208). Raiz del aislamiento.
+model Tenant {
+  id                   String       @id @default(uuid()) @db.Uuid
+  name                 String
+  legalName            String?      @map("legal_name")
+  identificationNumber String?      @map("identification_number")
+  phone                String?
+  email                String?
+  address              String?
+  status               TenantStatus @default(ACTIVE)
+  /// Moneda base del negocio (docs/07 766-772: "no hardcodear HNL en reglas").
+  /// Distinta de Plan.currency, que es la moneda con que la plataforma cobra.
+  baseCurrency         String       @default("HNL") @map("base_currency") @db.Char(3)
+  /// docs/07 756-761: timestamps en UTC, se muestran en la zona del tenant.
+  timezone             String       @default("America/Tegucigalpa")
+  createdAt            DateTime     @default(now()) @map("created_at")
+  updatedAt            DateTime     @updatedAt @map("updated_at")
+
+  memberships         TenantMembership[]
+  roles               Role[]
+  subscriptions       Subscription[]
+  subscriptionPeriods SubscriptionPeriod[]
+  saasPayments        SaaSPayment[]
+
+  @@index([status])
+  @@index([identificationNumber])
+  @@map("tenants")
+}
+
+/// Relacion usuario <-> tenant con un rol (docs/04 140-181).
+/// Un solo rol por membresia en V1 (multiples roles = extension futura, docs/03 986-991).
+model TenantMembership {
+  id        String           @id @default(uuid()) @db.Uuid
+  tenantId  String           @map("tenant_id") @db.Uuid
+  userId    String           @map("user_id") @db.Uuid
+  roleId    String           @map("role_id") @db.Uuid
+  status    MembershipStatus @default(ACTIVE)
+  createdAt DateTime         @default(now()) @map("created_at")
+  updatedAt DateTime         @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+  role   Role   @relation(fields: [roleId], references: [id], onDelete: Restrict)
+
+  @@unique([tenantId, userId])
+  @@index([userId])
+  @@index([tenantId, status])
+  @@index([roleId])
+  @@map("tenant_memberships")
+}
+
+/// Rol dentro de un tenant (docs/04 214-243). TENANT-OWNED.
+/// isSystem marca los roles predefinidos protegidos (docs/03 461-465).
+/// Sin herencia entre roles en V1 (docs/03 747-761).
+model Role {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  name        String
+  description String?
+  isSystem    Boolean  @default(false) @map("is_system")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  tenant      Tenant             @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  memberships TenantMembership[]
+  permissions RolePermission[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@map("roles")
+}
+
+/// Accion autorizable (docs/04 247-265). CATALOGO GLOBAL: sin tenantId.
+/// code = "modulo.accion" (docs/03 475-636). 70 permisos en el seed.
+model Permission {
+  id          String   @id @default(uuid()) @db.Uuid
+  code        String
+  module      String
+  description String?
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  roles RolePermission[]
+
+  @@unique([code])
+  @@index([module])
+  @@map("permissions")
+}
+
+/// Puente Role <-> Permission (docs/04 269-281).
+/// @@unique evita el mismo permiso dos veces en un rol (RP-020).
+model RolePermission {
+  id           String   @id @default(uuid()) @db.Uuid
+  roleId       String   @map("role_id") @db.Uuid
+  permissionId String   @map("permission_id") @db.Uuid
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@unique([roleId, permissionId])
+  @@index([permissionId])
+  @@map("role_permissions")
+}
+
+// ---------------------------------------------------------------------------
+// Plataforma SaaS
+// ---------------------------------------------------------------------------
+
+/// Plan comercial de la plataforma (docs/04 287-313). GLOBAL.
+/// `code` da identidad estable para el seed. PROHIBIDO ramificar logica por
+/// code o name: usar Feature / PlanLimit (AGENTS.md 19, docs/00 209-237).
+model Plan {
+  id              String          @id @default(uuid()) @db.Uuid
+  code            String
+  name            String
+  description     String?
+  price           Decimal         @default(0) @map("price") @db.Decimal(12, 2)
+  /// Moneda con que la plataforma cobra la suscripcion (no la del negocio).
+  currency        String          @default("HNL") @db.Char(3)
+  billingInterval BillingInterval @default(MONTHLY) @map("billing_interval")
+  /// docs/00 286-288 / RN-092: 7 dias por defecto, configurable a nivel plataforma.
+  gracePeriodDays Int             @default(7) @map("grace_period_days")
+  isActive        Boolean         @default(true) @map("is_active")
+  createdAt       DateTime        @default(now()) @map("created_at")
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+
+  features            PlanFeature[]
+  limits              PlanLimit[]
+  subscriptions       Subscription[]
+  subscriptionPeriods SubscriptionPeriod[]
+
+  @@unique([code])
+  @@index([isActive])
+  @@map("plans")
+}
+
+/// Funcionalidad activable por plan (docs/04 317-328). CATALOGO GLOBAL.
+model Feature {
+  id          String   @id @default(uuid()) @db.Uuid
+  code        String
+  name        String
+  description String?
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  plans PlanFeature[]
+
+  @@unique([code])
+  @@map("features")
+}
+
+/// Puente Plan <-> Feature (docs/04 332-352).
+model PlanFeature {
+  id        String   @id @default(uuid()) @db.Uuid
+  planId    String   @map("plan_id") @db.Uuid
+  featureId String   @map("feature_id") @db.Uuid
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  plan    Plan    @relation(fields: [planId], references: [id], onDelete: Cascade)
+  feature Feature @relation(fields: [featureId], references: [id], onDelete: Cascade)
+
+  @@unique([planId, featureId])
+  @@index([featureId])
+  @@map("plan_features")
+}
+
+/// Limite comercial de un plan (docs/04 356-379). key/value.
+/// value NULL = sin limite comercial (docs/00 255).
+model PlanLimit {
+  id        String   @id @default(uuid()) @db.Uuid
+  planId    String   @map("plan_id") @db.Uuid
+  key       String
+  value     Int?
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  plan Plan @relation(fields: [planId], references: [id], onDelete: Cascade)
+
+  @@unique([planId, key])
+  @@map("plan_limits")
+}
+
+/// Suscripcion de un tenant a un plan (docs/04 386-427). TENANT-OWNED.
+/// currentPeriodStart/End se duplican del periodo vigente a proposito
+/// (docs/04 400-409) para evitar un join en el guard de suscripcion.
+/// El historial vive en SubscriptionPeriod (RN-090).
+/// Un solo registro vigente por tenant: indice parcial en la migracion
+/// (subscription_one_active_per_tenant), no expresable en Prisma.
+model Subscription {
+  id                 String             @id @default(uuid()) @db.Uuid
+  tenantId           String             @map("tenant_id") @db.Uuid
+  planId             String             @map("plan_id") @db.Uuid
+  status             SubscriptionStatus @default(ACTIVE)
+  startDate          DateTime           @map("start_date")
+  currentPeriodStart DateTime           @map("current_period_start")
+  currentPeriodEnd   DateTime           @map("current_period_end")
+  /// Fin del periodo de gracia una vez en PAST_DUE (lo calcula la fase del job).
+  gracePeriodEndsAt  DateTime?          @map("grace_period_ends_at")
+  cancelledAt        DateTime?          @map("cancelled_at")
+  createdAt          DateTime           @default(now()) @map("created_at")
+  updatedAt          DateTime           @updatedAt @map("updated_at")
+
+  tenant   Tenant               @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  plan     Plan                 @relation(fields: [planId], references: [id], onDelete: Restrict)
+  periods  SubscriptionPeriod[]
+  payments SaaSPayment[]
+
+  @@index([tenantId, status])
+  @@index([planId])
+  @@index([status, currentPeriodEnd])
+  @@map("subscriptions")
+}
+
+/// Periodo historico de una suscripcion (docs/04 431-443, RN-090).
+/// Conserva el plan usado en ese periodo aunque el tenant cambie de plan.
+model SubscriptionPeriod {
+  id             String                   @id @default(uuid()) @db.Uuid
+  subscriptionId String                   @map("subscription_id") @db.Uuid
+  tenantId       String                   @map("tenant_id") @db.Uuid
+  planId         String                   @map("plan_id") @db.Uuid
+  periodStart    DateTime                 @map("period_start")
+  periodEnd      DateTime                 @map("period_end")
+  status         SubscriptionPeriodStatus @default(PENDING)
+  createdAt      DateTime                 @default(now()) @map("created_at")
+  updatedAt      DateTime                 @updatedAt @map("updated_at")
+
+  subscription Subscription  @relation(fields: [subscriptionId], references: [id], onDelete: Restrict)
+  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  plan         Plan          @relation(fields: [planId], references: [id], onDelete: Restrict)
+  payments     SaaSPayment[]
+
+  @@unique([subscriptionId, periodStart])
+  @@index([tenantId])
+  @@map("subscription_periods")
+}
+
+/// Pago del tenant al proveedor del SaaS (docs/04 447-469, RF-154).
+/// SEPARADO de SalePayment / CreditMovement / CashMovement (MD-008).
+/// Registro individual por pago, nunca un booleano `paid` (RN-089).
+model SaaSPayment {
+  id                   String   @id @default(uuid()) @db.Uuid
+  tenantId             String   @map("tenant_id") @db.Uuid
+  subscriptionId       String   @map("subscription_id") @db.Uuid
+  subscriptionPeriodId String?  @map("subscription_period_id") @db.Uuid
+  amount               Decimal  @db.Decimal(12, 2)
+  currency             String   @default("HNL") @db.Char(3)
+  paidAt               DateTime @map("paid_at")
+  reference            String?
+  notes                String?
+  /// Platform Admin que registro el pago (RF-154).
+  recordedByUserId     String   @map("recorded_by_user_id") @db.Uuid
+  createdAt            DateTime @default(now()) @map("created_at")
+  updatedAt            DateTime @updatedAt @map("updated_at")
+
+  tenant             Tenant              @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  subscription       Subscription        @relation(fields: [subscriptionId], references: [id], onDelete: Restrict)
+  subscriptionPeriod SubscriptionPeriod? @relation(fields: [subscriptionPeriodId], references: [id], onDelete: Restrict)
+  recordedBy         User                @relation("SaaSPaymentRecordedBy", fields: [recordedByUserId], references: [id], onDelete: Restrict)
+
+  /// Idempotencia de registro. Postgres trata los NULL como distintos,
+  /// asi que varios pagos sin referencia no colisionan.
+  @@unique([tenantId, reference])
+  @@index([subscriptionId])
+  @@index([tenantId, paidAt])
+  @@index([recordedByUserId])
+  @@map("saas_payments")
+}
+
+/// Auditoria de operaciones administrativas del SaaS (docs/04 1319-1348).
+/// SEPARADA del AuditLog operativo. Append-only: sin updatedAt, sin delete
+/// desde la aplicacion (docs/04 1313-1315, AGENTS.md 184-194).
+model PlatformAuditLog {
+  id          String   @id @default(uuid()) @db.Uuid
+  /// Actor: Platform Admin. Nullable para eventos de sistema (jobs).
+  actorUserId String?  @map("actor_user_id") @db.Uuid
+  /// Tenant afectado, cuando aplique (TENANT_CREATED, SUBSCRIPTION_SUSPENDED...).
+  tenantId    String?  @map("tenant_id") @db.Uuid
+  action      String
+  entityType  String   @map("entity_type")
+  entityId    String?  @map("entity_id")
+  metadata    Json?
+  ipAddress   String?  @map("ip_address")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  actor User? @relation("PlatformAuditActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, createdAt])
+  @@index([actorUserId, createdAt])
+  @@index([action, createdAt])
+  @@map("platform_audit_logs")
 }
