@@ -813,3 +813,119 @@ Debe cumplir, según corresponda:
 - migración;
 - manejo de errores;
 - documentación actualizada.
+
+---
+
+## 43. Decisiones de implementación — Autenticación (Fase 3)
+
+La sección 7 delega el mecanismo concreto al "bootstrap técnico". Estas son las
+decisiones tomadas al implementar la fase de autenticación, contexto de tenant y
+autorización base (AGENTS.md §28-29: se documentan aquí).
+
+### 43.1 Sesión
+
+**Sesión opaca con estado en base de datos** (modelo `Session`), no JWT.
+
+- El navegador solo recibe un token aleatorio de 32 bytes en la cookie
+  `ferreteria_session` (`httpOnly`, `sameSite=lax` configurable, `secure` en
+  producción, `path=/`). En la tabla `sessions` se guarda únicamente su
+  **SHA-256**; el token en claro nunca se persiste ni se registra.
+- Expiración **absoluta y deslizante**: `expires_at` se renueva en cada uso
+  (como mucho una escritura por minuto) hasta `SESSION_TTL_HOURS` (default 168 h
+  = 7 días).
+- **RF-004** se cumple de verdad: `logout` marca `revoked_at`; el guard rechaza
+  la sesión de inmediato. Al desactivar un usuario se revocan **todas** sus
+  sesiones.
+- `Session.active_tenant_id` es la **única** fuente del tenant activo. El
+  `tenantId` del cliente (body de `select-tenant`) es solo una propuesta que se
+  valida contra `TenantMembership` antes de persistirse (docs/00 §6, RN-003).
+
+### 43.2 Contraseñas
+
+**bcrypt** (`bcryptjs`, JS puro — sin binarios nativos, compatible con el build
+ESM), coste `BCRYPT_COST` (default 12). Verificación en tiempo constante: si el
+usuario no existe o no tiene `password_hash`, se ejecuta igualmente un `compare`
+contra un hash ficticio (anti *timing oracle*).
+
+El seed asigna contraseñas de desarrollo (`PLATFORM_ADMIN_PASSWORD` /
+`DEV_TENANT_OWNER_PASSWORD`, defaults `admin-dev-2026` / `owner-dev-2026`) solo
+fuera de producción y solo si el usuario aún no tiene credencial.
+
+### 43.3 Rate limiting
+
+`@nestjs/throttler` aplicado exclusivamente a `POST /auth/login`
+(`AUTH_LOGIN_RATE_LIMIT` / `AUTH_LOGIN_RATE_TTL_SECONDS`, default 5 / 60 s por
+IP). Cumple el requisito de la sección 41.
+
+### 43.4 Cadena de guards
+
+Cuatro guards globales, en el orden de AGENTS.md §6:
+
+1. `AuthenticationGuard` — cookie → sesión → usuario `ACTIVE` (revalidado en
+   cada request). Se salta con `@Public()`.
+2. `PlatformAdminGuard` — solo rutas `@PlatformAdminOnly()`; exige
+   `isPlatformAdmin` y **no** resuelve contexto de tenant (RP-008).
+3. `TenantContextGuard` — Membership → Tenant status → Subscription. Construye el
+   `RequestContext`. Se salta con `@Public()` / `@PlatformAdminOnly()`; con
+   `@TenantOptional()` no falla si el contexto no resuelve (lo usa `/auth/me`).
+4. `PermissionsGuard` — `@RequirePermissions(...)`; exige **todos**. Sin permiso
+   explícito → denegado (RF-012 / RP-033).
+
+**Feature y límite** (pasos 5-6) tienen servicios centralizados
+(`FeatureService`, `LimitService`) listos, pero todavía no se aplican como guard:
+los invocarán los módulos de dominio cuando existan.
+
+### 43.5 Resolución del tenant activo
+
+- 0 membresías activas → `NO_TENANT_ACCESS` (403). En **login** también se
+  deniega (coincide con el diagrama de docs/05 §4), salvo Platform Admin.
+- 1 membresía activa → auto-selección, persistida en la sesión.
+- >1 y ninguna elegida → `TENANT_SELECTION_REQUIRED` (409) en endpoints
+  tenant-scoped; `/auth/me` devuelve la lista para que el frontend muestre el
+  selector.
+
+### 43.6 Suscripción "utilizable"
+
+`ACTIVE` o `PAST_DUE` permiten operar (docs/05 §50, índice parcial
+`subscription_one_active_per_tenant`). `SUSPENDED` / `CANCELLED` / inexistente →
+`SUBSCRIPTION_UNUSABLE`. Tenant `SUSPENDED` → `TENANT_SUSPENDED`. La política
+"acceso mínimo durante suspensión" (docs/05 1686) se implementará con un
+decorador `@AllowSuspended` sobre endpoints concretos (estado de cuenta,
+reactivación) cuando esos endpoints existan; por ahora se bloquea todo lo
+tenant-scoped.
+
+### 43.7 Catálogo de códigos de error (RF-180)
+
+Forma estable de todo error: `{ code, message, details? }` (`@ferreteria/types`
+`ApiError`), vía un filtro global.
+
+| HTTP | `code` | Categoría RF-180 |
+|---|---|---|
+| 400 | `VALIDATION_ERROR` | validación |
+| 401 | `UNAUTHENTICATED`, `SESSION_EXPIRED`, `INVALID_CREDENTIALS` | autenticación |
+| 403 | `ACCOUNT_INACTIVE`, `NO_TENANT_ACCESS`, `TENANT_ACCESS_DENIED`, `MEMBERSHIP_INACTIVE`, `TENANT_SUSPENDED`, `SUBSCRIPTION_UNUSABLE`, `PERMISSION_DENIED`, `PLATFORM_ADMIN_REQUIRED` | autorización |
+| 403 | `FEATURE_NOT_AVAILABLE` | feature no disponible |
+| 404 | `NOT_FOUND` | recurso inexistente |
+| 409 | `TENANT_SELECTION_REQUIRED` | conflicto |
+| 409 | `PLAN_LIMIT_REACHED` | límite del plan |
+| 422 | *(reservado)* | regla de negocio |
+| 429 | `RATE_LIMITED` | — |
+| 500 | `INTERNAL_ERROR` | — (sin stack trace al cliente) |
+
+### 43.8 Endpoints
+
+| Método | Ruta | Protección |
+|---|---|---|
+| POST | `/api/auth/login` | pública + rate limit |
+| POST | `/api/auth/logout` | autenticado |
+| GET | `/api/auth/me` | autenticado (tenant opcional) |
+| POST | `/api/auth/select-tenant` | autenticado (tenant opcional) |
+| GET | `/api/auth/context` | autenticado + tenant + suscripción |
+| GET | `/api/roles` | + permiso `roles.read` |
+
+### 43.9 `RequestContext`
+
+Se mantiene el contrato de la sección 5 sin cambios
+(`{ userId, tenantId, membershipId, roleId, permissions }`). Los datos extra
+para features/límites (`tenant`, `subscription` con su set de features y mapa de
+límites) viajan aparte en `request.tenantContext`, no en el contrato público.

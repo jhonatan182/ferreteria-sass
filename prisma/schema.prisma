@@ -1,12 +1,15 @@
-// Esquema Prisma — Fase 2: Fundacion SaaS e Identidad.
+// Esquema Prisma.
 //
-// Alcance de esta fase (docs/04-MODELO-DE-DOMINIO.md 1771-1791):
+// Fase 2 — Fundacion SaaS e Identidad (docs/04-MODELO-DE-DOMINIO.md 1771-1791):
 //   Identidad:  User, Tenant, TenantMembership, Role, Permission, RolePermission
 //   Plataforma: Plan, Feature, PlanFeature, PlanLimit,
 //               Subscription, SubscriptionPeriod, SaaSPayment, PlatformAuditLog
 //
+// Fase 3 — Autenticacion y contexto (docs/07-ARQUITECTURA-TECNICA.md 154-214):
+//   Session (sesion opaca en BD; ver decisiones en docs/07 seccion 43)
+//
 // Fuera de alcance (fases posteriores, cada una con su migracion — AGENTS.md 22):
-//   autenticacion, productos, inventario, compras, ventas, caja, creditos,
+//   productos, inventario, compras, ventas, caja, creditos,
 //   reportes, AuditLog operativo.
 //
 // Reglas al modelar (docs/07-ARQUITECTURA-TECNICA.md 10-13, 233-257):
@@ -105,6 +108,7 @@ model User {
   updatedAt       DateTime   @updatedAt @map("updated_at")
 
   memberships          TenantMembership[]
+  sessions             Session[]
   saasPaymentsRecorded SaaSPayment[]      @relation("SaaSPaymentRecordedBy")
   platformAuditLogs    PlatformAuditLog[] @relation("PlatformAuditActor")
 
@@ -137,6 +141,7 @@ model Tenant {
   subscriptions       Subscription[]
   subscriptionPeriods SubscriptionPeriod[]
   saasPayments        SaaSPayment[]
+  activeSessions      Session[]
 
   @@index([status])
   @@index([identificationNumber])
@@ -217,6 +222,47 @@ model RolePermission {
   @@unique([roleId, permissionId])
   @@index([permissionId])
   @@map("role_permissions")
+}
+
+// ---------------------------------------------------------------------------
+// Autenticacion (Fase 3)
+// ---------------------------------------------------------------------------
+
+/// Sesion autenticada de un usuario (docs/07 154-169; decisiones en docs/07 seccion 43).
+///
+/// Sesion OPACA con estado en BD: el navegador solo guarda un token aleatorio
+/// en una cookie httpOnly; aqui se guarda unicamente su hash SHA-256. Permite
+/// cumplir RF-004 ("invalidar la sesion actual") de forma real y cortar el
+/// acceso al instante cuando el usuario se desactiva.
+///
+/// `activeTenantId` es la unica fuente del tenant activo (docs/00 191-203,
+/// RN-003): el backend nunca acepta un tenantId de la peticion como prueba de
+/// pertenencia; la seleccion se persiste aqui y se revalida contra
+/// TenantMembership en cada request.
+model Session {
+  id             String    @id @default(uuid()) @db.Uuid
+  userId         String    @map("user_id") @db.Uuid
+  /// SHA-256 (hex) del token de sesion. El token en claro nunca se persiste.
+  tokenHash      String    @unique @map("token_hash")
+  /// Tenant seleccionado para esta sesion. NULL mientras el usuario con varias
+  /// membresias no ha elegido (docs/05 128-155).
+  activeTenantId String?   @map("active_tenant_id") @db.Uuid
+  userAgent      String?   @map("user_agent")
+  ipAddress      String?   @map("ip_address")
+  /// Expiracion absoluta. Se desliza en cada uso hasta este tope.
+  expiresAt      DateTime  @map("expires_at")
+  /// Revocacion explicita (logout, desactivacion del usuario, cambio de credencial).
+  revokedAt      DateTime? @map("revoked_at")
+  lastUsedAt     DateTime  @default(now()) @map("last_used_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tenant Tenant? @relation(fields: [activeTenantId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
 }
 
 // ---------------------------------------------------------------------------

@@ -13,8 +13,11 @@
  *
  * Todo con upsert => idempotente, re-ejecutable.
  *
- * Sin credenciales en codigo: el Platform Admin y el owner demo se crean sin
- * passwordHash (la autenticacion se implementa en una fase posterior).
+ * Credenciales: el catalogo de plataforma nunca lleva credenciales. En
+ * desarrollo (NODE_ENV != production) se asigna una contrasena por defecto al
+ * Platform Admin y al owner demo — configurable por PLATFORM_ADMIN_PASSWORD /
+ * DEV_TENANT_OWNER_PASSWORD — solo si el usuario todavia no tiene una, para
+ * poder probar el login. En produccion la credencial la fija el flujo de auth.
  * Identidad de usuarios y tenant tomada de variables de entorno.
  *
  * Prisma 7 usa driver adapter (sin engine): se construye el PrismaClient con
@@ -24,6 +27,7 @@
 import 'dotenv/config';
 
 import { PrismaPg } from '@prisma/adapter-pg';
+import bcrypt from 'bcryptjs';
 
 import { FEATURE_CATALOG, FEATURE_CODES } from '../apps/api/src/authz/feature-codes.js';
 import { PERMISSION_CATALOG } from '../apps/api/src/authz/permissions.catalog.js';
@@ -39,6 +43,28 @@ if (!connectionString) {
 const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString }) });
 
 const DEV_PLAN_CODE = 'DEV';
+
+/**
+ * Contrasenas de desarrollo. SOLO se usan fuera de produccion (seedDevelopment
+ * ya corta si NODE_ENV=production). Sirven para poder probar el login recien
+ * clonado el repo; en un despliegue real las credenciales se establecen por el
+ * flujo de autenticacion, nunca aqui. Coste bcrypt alineado con
+ * apps/api/src/auth/auth.constants.ts (DEFAULT_BCRYPT_COST = 12).
+ */
+const BCRYPT_COST = 12;
+const DEV_ADMIN_PASSWORD = process.env.PLATFORM_ADMIN_PASSWORD ?? 'admin-dev-2026';
+const DEV_OWNER_PASSWORD = process.env.DEV_TENANT_OWNER_PASSWORD ?? 'owner-dev-2026';
+
+/** Fija la contrasena solo si el usuario aun no tiene una (no pisa credenciales reales). */
+async function ensureDevPassword(email: string, plain: string): Promise<void> {
+  const user = await prisma.user.findUnique({ where: { email } });
+  if (user && !user.passwordHash) {
+    await prisma.user.update({
+      where: { email },
+      data: { passwordHash: await bcrypt.hash(plain, BCRYPT_COST) },
+    });
+  }
+}
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -237,6 +263,14 @@ async function seedDevelopment(): Promise<void> {
   await seedPlatformAdmin();
   const planId = await seedDevPlan();
   await seedDevTenant(planId);
+
+  // Credenciales de desarrollo (idempotente: no pisa contrasenas existentes).
+  await ensureDevPassword(requireEnv('PLATFORM_ADMIN_EMAIL'), DEV_ADMIN_PASSWORD);
+  await ensureDevPassword(requireEnv('DEV_TENANT_OWNER_EMAIL'), DEV_OWNER_PASSWORD);
+  console.log(
+    `  credenciales dev: ${requireEnv('PLATFORM_ADMIN_EMAIL')} / ${DEV_ADMIN_PASSWORD} · ` +
+      `${requireEnv('DEV_TENANT_OWNER_EMAIL')} / ${DEV_OWNER_PASSWORD}`,
+  );
 }
 
 async function main(): Promise<void> {

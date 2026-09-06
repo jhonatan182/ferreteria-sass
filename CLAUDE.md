@@ -47,20 +47,32 @@ Gestor: **pnpm workspaces** (`pnpm-workspace.yaml`).
 ```text
 apps/
   web/    Next.js (App Router) + TypeScript + Tailwind + shadcn/ui   -> @ferreteria/web
+          login / select-tenant / pantalla protegida `/app`, AuthProvider,
+          `src/lib/api.ts` (fetch con cookie), `src/proxy.ts` (redirección UX)
   api/    NestJS + TypeScript (ESM) + Prisma                         -> @ferreteria/api
   api/src/authz/  catálogo de permisos, plantillas de roles de sistema,
                   códigos de features y claves de límites (consumido por
-                  el seed y, después, por guards y provisioning de tenants)
+                  el seed, los guards y el provisioning de tenants)
+  api/src/auth/   fase 3: sesión opaca en BD, PasswordService (bcrypt),
+                  TenantContextService, Feature/Limit services, 4 guards
+                  globales (auth → platform-admin → tenant-context → permisos),
+                  decoradores (@Public, @PlatformAdminOnly, @TenantOptional,
+                  @RequirePermissions, @CurrentUser/@CurrentContext).
+                  Decisiones: docs/07 §43
+  api/src/common/ filtro global de errores + catálogo `ERROR_CODES`
+  api/src/roles/  `GET /api/roles` (permiso `roles.read`), tenant-scoped
 packages/
   config/      tsconfig / prettier / oxlint compartidos             -> @ferreteria/config
   types/       contratos de tipos, sin runtime                      -> @ferreteria/types
   validation/  esquemas zod runtime (uuid, dinero, cantidad, ...)    -> @ferreteria/validation
 prisma/
-  schema.prisma   fundación SaaS e identidad (14 modelos): User, Tenant,
+  schema.prisma   15 modelos: fundación SaaS e identidad (User, Tenant,
                   TenantMembership, Role, Permission, RolePermission, Plan,
                   Feature, PlanFeature, PlanLimit, Subscription,
-                  SubscriptionPeriod, SaaSPayment, PlatformAuditLog
+                  SubscriptionPeriod, SaaSPayment, PlatformAuditLog) +
+                  Session (fase 3: sesión opaca, token SHA-256, activeTenantId)
   seed.ts         catálogo de plataforma (todo entorno) + datos de desarrollo
+                  (incluye contraseñas dev, solo fuera de producción)
   migrations/     migraciones versionadas
 prisma.config.ts  configuración del CLI de Prisma 7 (la conexión de PrismaClient
                   usa un driver adapter en apps/api/src/prisma/prisma.service.ts)
