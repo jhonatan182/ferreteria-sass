@@ -1,0 +1,21 @@
+// Esquema Prisma — base tecnica.
+//
+// En esta fase SOLO se define datasource + generator.
+// El modelo de dominio (Tenant, User, Product, Inventory, Sales, ...) se
+// agrega en fases posteriores, cada cambio con su migracion (AGENTS.md 22).
+//
+// Reglas al modelar (docs/07-ARQUITECTURA-TECNICA.md 10-13):
+//   - IDs = UUID
+//   - dinero y cantidades fraccionables = Decimal, nunca Float
+//   - relaciones explicitas e indices tenant-aware
+//   - unicidad compuesta por tenant cuando corresponda
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../apps/api/src/generated/prisma"
+  moduleFormat = "esm"
+}
+
+datasource db {
+  provider = "postgresql"
+}

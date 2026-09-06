@@ -1,0 +1,20 @@
+{
+  "name": "@ferreteria/config",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Configuracion compartida del monorepo: tsconfig, prettier, oxlint",
+  "files": [
+    "tsconfig",
+    "prettier",
+    "oxlint"
+  ],
+  "exports": {
+    "./tsconfig/base.json": "./tsconfig/base.json",
+    "./tsconfig/library.json": "./tsconfig/library.json",
+    "./tsconfig/nestjs.json": "./tsconfig/nestjs.json",
+    "./tsconfig/nextjs.json": "./tsconfig/nextjs.json",
+    "./prettier": "./prettier/index.mjs",
+    "./oxlint/base.json": "./oxlint/base.json"
+  }
+}

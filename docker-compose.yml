@@ -1,0 +1,23 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: ferreteria_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ferreteria
+      POSTGRES_PASSWORD: ferreteria
+      POSTGRES_DB: ferreteria
+    # Puerto host 5433 para no chocar con instalaciones locales de PostgreSQL
+    # en 5432. Dentro de la red de Docker sigue siendo 5432.
+    ports:
+      - '5433:5432'
+    volumes:
+      - ferreteria_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ferreteria -d ferreteria']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  ferreteria_pgdata:
