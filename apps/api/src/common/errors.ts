@@ -26,8 +26,15 @@ export const ERROR_CODES = {
   // --- Conflicto / estado (409) ------------------------------------------
   TENANT_SELECTION_REQUIRED: 'TENANT_SELECTION_REQUIRED',
   PLAN_LIMIT_REACHED: 'PLAN_LIMIT_REACHED',
+  // --- Dominio: productos y catalogos (Fase 4) --------------------------
+  PRODUCT_CODE_TAKEN: 'PRODUCT_CODE_TAKEN',
+  PRODUCT_BARCODE_TAKEN: 'PRODUCT_BARCODE_TAKEN',
+  CATALOG_NAME_TAKEN: 'CATALOG_NAME_TAKEN',
+  CATALOG_IN_USE: 'CATALOG_IN_USE',
+  INVALID_PRESENTATION: 'INVALID_PRESENTATION',
   // --- Genericos ---------------------------------------------------------
   VALIDATION_ERROR: 'VALIDATION_ERROR',
+  BUSINESS_RULE_VIOLATION: 'BUSINESS_RULE_VIOLATION',
   NOT_FOUND: 'NOT_FOUND',
   RATE_LIMITED: 'RATE_LIMITED',
   INTERNAL_ERROR: 'INTERNAL_ERROR',
@@ -77,5 +84,23 @@ export class ForbiddenException extends AppException {
 export class ConflictException extends AppException {
   constructor(code: ErrorCode, message: string, details?: unknown) {
     super(code, message, HttpStatus.CONFLICT, details);
+  }
+}
+
+/** Recurso inexistente o fuera del tenant activo (docs/07 493-514: 404). */
+export class NotFoundException extends AppException {
+  constructor(message = 'Recurso no encontrado.', details?: unknown) {
+    super(ERROR_CODES.NOT_FOUND, message, HttpStatus.NOT_FOUND, details);
+  }
+}
+
+/**
+ * Regla de negocio no satisfecha (docs/07 493-514: 422). Distinto de
+ * `VALIDATION_ERROR` (forma de la peticion) y de `ConflictException`
+ * (colision de estado/concurrencia).
+ */
+export class BusinessRuleException extends AppException {
+  constructor(code: ErrorCode, message: string, details?: unknown) {
+    super(code, message, HttpStatus.UNPROCESSABLE_ENTITY, details);
   }
 }

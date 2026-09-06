@@ -1737,7 +1737,11 @@ la creación será rechazada.
 
 Los productos inactivos podrán o no contar contra el límite dependiendo de la política comercial final.
 
-La recomendación inicial es que el límite represente productos activos.
+**Decisión (Fase 4, docs/04 §45):** el límite representa **productos activos**. `MAX_PRODUCTS`
+cuenta las filas `Product` con `status = ACTIVE` del tenant, calculado dentro de la transacción
+tanto al crear un producto como al reactivar uno inactivo (`POST /products/:id/activate`). Un
+producto desactivado libera plaza. Coincide con `apps/api/src/authz/plan-limits.ts` y con la
+semántica de `MAX_USERS` (§54).
 
 ---
 

@@ -12,7 +12,8 @@ export function proxy(req: NextRequest): NextResponse {
   const hasSession = req.cookies.has(SESSION_COOKIE);
   const { pathname } = req.nextUrl;
 
-  if (!hasSession && (pathname === '/app' || pathname === '/select-tenant')) {
+  const inApp = pathname === '/app' || pathname.startsWith('/app/');
+  if (!hasSession && (inApp || pathname === '/select-tenant')) {
     return NextResponse.redirect(new URL('/login', req.url));
   }
   if (hasSession && pathname === '/login') {
@@ -22,5 +23,5 @@ export function proxy(req: NextRequest): NextResponse {
 }
 
 export const config = {
-  matcher: ['/', '/login', '/app', '/select-tenant'],
+  matcher: ['/', '/login', '/app', '/app/:path*', '/select-tenant'],
 };

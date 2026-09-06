@@ -93,6 +93,8 @@ export class AllExceptionsFilter implements ExceptionFilter {
         return ERROR_CODES.NOT_FOUND;
       case HttpStatus.CONFLICT:
         return ERROR_CODES.PLAN_LIMIT_REACHED;
+      case HttpStatus.UNPROCESSABLE_ENTITY:
+        return ERROR_CODES.BUSINESS_RULE_VIOLATION;
       case HttpStatus.TOO_MANY_REQUESTS:
         return ERROR_CODES.RATE_LIMITED;
       default:

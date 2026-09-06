@@ -8,9 +8,12 @@
 // Fase 3 — Autenticacion y contexto (docs/07-ARQUITECTURA-TECNICA.md 154-214):
 //   Session (sesion opaca en BD; ver decisiones en docs/07 seccion 43)
 //
+// Fase 4 — Catalogo de productos (docs/04 473-608, decisiones en docs/04 seccion 45):
+//   Unit, Category, Brand, Product, ProductPresentation, TenantProductSequence,
+//   AuditLog (operativo, append-only)
+//
 // Fuera de alcance (fases posteriores, cada una con su migracion — AGENTS.md 22):
-//   productos, inventario, compras, ventas, caja, creditos,
-//   reportes, AuditLog operativo.
+//   inventario, compras, ventas, caja, creditos, reportes.
 //
 // Reglas al modelar (docs/07-ARQUITECTURA-TECNICA.md 10-13, 233-257):
 //   - IDs = UUID
@@ -85,6 +88,15 @@ enum BillingInterval {
   @@map("billing_interval")
 }
 
+/// Estado de una entidad de catalogo (RN-009, docs/04 1416-1445): sin borrado
+/// fisico cuando puede tener historial; se activa / desactiva.
+enum CatalogStatus {
+  ACTIVE
+  INACTIVE
+
+  @@map("catalog_status")
+}
+
 // ---------------------------------------------------------------------------
 // Identidad
 // ---------------------------------------------------------------------------
@@ -111,6 +123,7 @@ model User {
   sessions             Session[]
   saasPaymentsRecorded SaaSPayment[]      @relation("SaaSPaymentRecordedBy")
   platformAuditLogs    PlatformAuditLog[] @relation("PlatformAuditActor")
+  auditLogs            AuditLog[]
 
   @@unique([email])
   @@index([status])
@@ -136,12 +149,19 @@ model Tenant {
   createdAt            DateTime     @default(now()) @map("created_at")
   updatedAt            DateTime     @updatedAt @map("updated_at")
 
-  memberships         TenantMembership[]
-  roles               Role[]
-  subscriptions       Subscription[]
-  subscriptionPeriods SubscriptionPeriod[]
-  saasPayments        SaaSPayment[]
-  activeSessions      Session[]
+  memberships          TenantMembership[]
+  roles                Role[]
+  subscriptions        Subscription[]
+  subscriptionPeriods  SubscriptionPeriod[]
+  saasPayments         SaaSPayment[]
+  activeSessions       Session[]
+  units                Unit[]
+  categories           Category[]
+  brands               Brand[]
+  products             Product[]
+  productPresentations ProductPresentation[]
+  productSequence      TenantProductSequence?
+  auditLogs            AuditLog[]
 
   @@index([status])
   @@index([identificationNumber])
@@ -453,4 +473,186 @@ model PlatformAuditLog {
   @@index([actorUserId, createdAt])
   @@index([action, createdAt])
   @@map("platform_audit_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Productos y catalogos (Fase 4)
+// ---------------------------------------------------------------------------
+//
+// docs/04 473-608, docs/05 236-448, docs/06 171-241, docs/02 93-264.
+// Decisiones que la documentacion no cerraba: docs/04 seccion 45.
+//   - Unit es TENANT-OWNED (docs/04 seccion 45, D1): docs/04 569-571 permitia
+//     un catalogo global, pero `products.manage_units` es un permiso de tenant.
+//   - internalCode se autogenera con una tabla contador por tenant
+//     (TenantProductSequence, D2) para no depender de MAX+1 bajo concurrencia.
+//   - Sin costo en esta fase (D4): `averageCost` pertenece a InventoryBalance
+//     (docs/04 616-643) y nace con el modulo de inventario / compras.
+
+/// Unidad de medida de un tenant (docs/04 552-571, RN-011). TENANT-OWNED.
+/// El inventario se controla en la unidad base del producto; las presentaciones
+/// definen como se comercializa (docs/04 610-613).
+model Unit {
+  id        String        @id @default(uuid()) @db.Uuid
+  tenantId  String        @map("tenant_id") @db.Uuid
+  code      String
+  name      String
+  symbol    String?
+  status    CatalogStatus @default(ACTIVE)
+  createdAt DateTime      @default(now()) @map("created_at")
+  updatedAt DateTime      @updatedAt @map("updated_at")
+
+  tenant             Tenant                @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  baseUnitOfProducts Product[]             @relation("ProductBaseUnit")
+  presentations      ProductPresentation[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId, status])
+  @@map("units")
+}
+
+/// Categoria de productos de un tenant (docs/04 512-527, RN-002). TENANT-OWNED.
+model Category {
+  id          String        @id @default(uuid()) @db.Uuid
+  tenantId    String        @map("tenant_id") @db.Uuid
+  name        String
+  description String?
+  status      CatalogStatus @default(ACTIVE)
+  createdAt   DateTime      @default(now()) @map("created_at")
+  updatedAt   DateTime      @updatedAt @map("updated_at")
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  products Product[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId, status])
+  @@map("categories")
+}
+
+/// Marca de producto de un tenant (docs/04 531-546, RN-002). TENANT-OWNED.
+model Brand {
+  id          String        @id @default(uuid()) @db.Uuid
+  tenantId    String        @map("tenant_id") @db.Uuid
+  name        String
+  description String?
+  status      CatalogStatus @default(ACTIVE)
+  createdAt   DateTime      @default(now()) @map("created_at")
+  updatedAt   DateTime      @updatedAt @map("updated_at")
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  products Product[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId, status])
+  @@map("brands")
+}
+
+/// Articulo comercializado por la ferreteria (docs/04 475-508, RN-005..RN-010).
+/// TENANT-OWNED. `internalCode` y `barcode` son conceptos distintos (RN-008):
+///   - internalCode: unico por tenant, autogenerado si no se envia (docs/05 290-318)
+///   - barcode:      opcional; cuando existe, unico por tenant (RN-007)
+/// Sin borrado fisico (RN-010): status ACTIVE / INACTIVE.
+model Product {
+  id           String        @id @default(uuid()) @db.Uuid
+  tenantId     String        @map("tenant_id") @db.Uuid
+  internalCode String        @map("internal_code")
+  barcode      String?
+  name         String
+  description  String?
+  categoryId   String?       @map("category_id") @db.Uuid
+  brandId      String?       @map("brand_id") @db.Uuid
+  baseUnitId   String        @map("base_unit_id") @db.Uuid
+  status       CatalogStatus @default(ACTIVE)
+  createdAt    DateTime      @default(now()) @map("created_at")
+  updatedAt    DateTime      @updatedAt @map("updated_at")
+
+  tenant        Tenant                @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  category      Category?             @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  brand         Brand?                @relation(fields: [brandId], references: [id], onDelete: Restrict)
+  baseUnit      Unit                  @relation("ProductBaseUnit", fields: [baseUnitId], references: [id], onDelete: Restrict)
+  presentations ProductPresentation[]
+
+  /// Postgres trata los NULL como distintos: varios productos sin barcode no
+  /// colisionan (mismo comportamiento que SaaSPayment.reference, docs/07 246-257).
+  @@unique([tenantId, internalCode])
+  @@unique([tenantId, barcode])
+  @@index([tenantId, status])
+  @@index([tenantId, name])
+  @@index([categoryId])
+  @@index([brandId])
+  @@index([baseUnitId])
+  @@map("products")
+}
+
+/// Presentacion o unidad comercial de un producto (docs/04 575-613, RN-012..RN-016).
+/// `conversionFactor` convierte a la unidad base (docs/04 203-217); `salePrice`
+/// es independiente por presentacion (RN-015). Una sola presentacion principal
+/// por producto: indice unico parcial en la migracion
+/// (product_one_default_presentation), no expresable en Prisma.
+model ProductPresentation {
+  id               String        @id @default(uuid()) @db.Uuid
+  /// Desnormalizado del producto para consultas tenant-aware directas (AGENTS.md 5).
+  tenantId         String        @map("tenant_id") @db.Uuid
+  productId        String        @map("product_id") @db.Uuid
+  unitId           String        @map("unit_id") @db.Uuid
+  name             String
+  conversionFactor Decimal       @map("conversion_factor") @db.Decimal(18, 6)
+  salePrice        Decimal       @map("sale_price") @db.Decimal(14, 4)
+  isDefault        Boolean       @default(false) @map("is_default")
+  status           CatalogStatus @default(ACTIVE)
+  createdAt        DateTime      @default(now()) @map("created_at")
+  updatedAt        DateTime      @updatedAt @map("updated_at")
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+  unit    Unit    @relation(fields: [unitId], references: [id], onDelete: Restrict)
+
+  @@unique([productId, name])
+  @@index([tenantId, productId, status])
+  @@index([unitId])
+  @@map("product_presentations")
+}
+
+/// Contador de codigo interno por tenant (docs/05 290-318, RN-006). El prefijo
+/// es configurable por tenant. La generacion se hace con
+/// `UPDATE ... SET next_value = next_value + 1 RETURNING` DENTRO de la
+/// transaccion de creacion del producto: el row lock de Postgres serializa a los
+/// concurrentes (AGENTS.md 21). Nunca `SELECT MAX(internal_code) + 1`.
+model TenantProductSequence {
+  tenantId  String   @id @map("tenant_id") @db.Uuid
+  prefix    String   @default("FER")
+  padding   Int      @default(6)
+  nextValue Int      @default(1) @map("next_value")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("tenant_product_sequences")
+}
+
+/// Auditoria operativa de un tenant (docs/04 1278-1315, RN-076, RF-140).
+/// SEPARADA de PlatformAuditLog (operaciones del SaaS). Append-only: sin
+/// updatedAt, sin delete ni update desde la aplicacion (docs/04 1313-1315).
+/// La escritura ocurre DENTRO de la misma transaccion que la operacion auditada
+/// (docs/05 1782-1810).
+model AuditLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  tenantId   String   @map("tenant_id") @db.Uuid
+  /// Actor. Nullable para eventos de sistema (jobs) y para no perder el registro
+  /// si el usuario se elimina fisicamente en el futuro.
+  userId     String?  @map("user_id") @db.Uuid
+  action     String
+  entityType String   @map("entity_type")
+  entityId   String?  @map("entity_id")
+  metadata   Json?
+  ipAddress  String?  @map("ip_address")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  user   User?  @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, entityType, entityId])
+  @@index([tenantId, action, createdAt])
+  @@map("audit_logs")
 }

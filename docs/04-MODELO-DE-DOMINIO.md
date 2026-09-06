@@ -2130,3 +2130,131 @@ Se señalan sin perpetuarlas (RN-101). El catálogo sembrado son exactamente los
 - Política de escala y redondeo decimal (sección 28). El dinero SaaS usa
   `Decimal(12,2)`, suficiente y sin prejuzgar la escala del dominio operativo.
 - Autenticación: no se implementa nada en esta fase.
+
+---
+
+# 45. Apéndice — Decisiones de implementación (Fase 4: catálogo de productos)
+
+Esta fase materializó en `prisma/schema.prisma` las entidades de catálogo de la sección 39
+(`Unit`, `Category`, `Brand`, `Product`, `ProductPresentation`) más `AuditLog` (auditoría
+operativa, append-only) y una entidad auxiliar `TenantProductSequence`. Backend en
+`apps/api/src/products/` y `apps/api/src/audit/`; frontend funcional en `apps/web/src/app/app/`.
+**No** se implementaron existencias, `InventoryBalance`, `InventoryMovement`, compras, ventas,
+caja, créditos ni reportes.
+
+## 45.1 Decisiones sobre puntos abiertos (RN-101)
+
+1. **`Unit` es tenant-owned** (D1). La sección 10.1 permitía un "catálogo global del sistema",
+   pero docs/03 define el permiso **tenant-scoped** `products.manage_units` y docs/05 §8 pide
+   configurar "unidades" al provisionar cada tenant. Se modela `Unit` con `tenantId` y
+   `@@unique([tenantId, code])`. Cada tenant recibe una copia de `DEFAULT_TENANT_UNITS`
+   (`apps/api/src/catalog/unit-catalog.ts`: UNIDAD, LIBRA, KILOGRAMO, QUINTAL, METRO, PIE, LITRO,
+   GALON, CAJA, ROLLO), fuente única para el seed y el futuro provisioning.
+
+2. **Generación de `internalCode`** (D2). docs/05 §10 pide "obtener siguiente secuencia
+   independiente por tenant" sin definir la entidad. Se usa una tabla contador
+   `TenantProductSequence { tenantId @id, prefix @default("FER"), padding @default(6), nextValue }`
+   y, **dentro de la transacción de creación**, `UPDATE … SET next_value = next_value + 1
+   RETURNING`. El row lock de Postgres serializa a los concurrentes (AGENTS.md 21); nunca
+   `SELECT MAX(internal_code) + 1`. El prefijo es configurable por tenant (RN-006). Solo se
+   autogenera si el usuario no envía `internalCode` (docs/05 §10); ante colisión con un código
+   escrito a mano se reintenta hasta 5 veces.
+
+3. **Autorización de categorías y marcas** (D3). El catálogo formal de docs/03 (477-487) no
+   define `categories.*` ni `brands.*`, y los tests fijan 70 permisos exactos. Se **reusan**
+   `products.read` / `products.create` / `products.update`. No se inventan códigos (RN-101,
+   §44.2). Las unidades usan `products.manage_units` para escritura.
+
+4. **Sin costo en esta fase** (D4). `averageCost` es atributo de `InventoryBalance` (sección
+   11.1) y RN-102 prohíbe mutar saldos sin movimiento. `Product` **no** tiene ningún campo de
+   costo; el permiso `products.change_cost` queda sin endpoint hasta el módulo de inventario /
+   compras, donde el costo promedio ponderado nace de las compras (sección 13, docs/07 §19).
+   El flujo docs/05 §13 ("modificar costo") queda pendiente para esa fase.
+
+5. **Escala decimal** (D5). La sección 28 dejó la política "para antes del esquema físico" y
+   nunca se cerró. Para el catálogo: `ProductPresentation.salePrice` = `Decimal(14,4)`;
+   `ProductPresentation.conversionFactor` = `Decimal(18,6)`. Cantidades e importes viajan como
+   **cadena** en la API, nunca `number` (AGENTS.md 11-12). El dinero de inventario/ventas
+   (`unitCost`, `averageCost`, totales) fijará su escala en su fase; 4 decimales para precio
+   son coherentes con el ejemplo de costo promedio "L. 10.6667" de la sección 13.
+
+6. **Presentación principal única** (D6). `ProductPresentation.isDefault` con índice único
+   **parcial** en Postgres `product_one_default_presentation ON product_presentations
+   (product_id) WHERE is_default = true` (añadido a mano en la migración, no expresable en
+   Prisma — mismo procedimiento que `subscription_one_active_per_tenant`). El servicio además
+   valida a nivel de aplicación: la primera presentación de un producto nace principal;
+   `set-default` mueve la marca dentro de una transacción; no se puede desactivar la principal
+   sin designar otra antes.
+
+7. **`AuditLog` operativo**. No existía (solo `PlatformAuditLog`). Es entidad V1 (sección 39) y
+   requisito de RF-140 / docs/05 §57. Append-only (sin `updatedAt`, sin update/delete desde la
+   aplicación). `AuditService.record(tx, ctx, entry)` escribe **dentro de la misma transacción**
+   que la operación auditada (docs/05 §56). Acciones registradas en esta fase: `PRODUCT_CREATED`,
+   `PRODUCT_UPDATED`, `PRODUCT_ACTIVATED`, `PRODUCT_DEACTIVATED`, `PRODUCT_PRICE_CHANGED`
+   (metadata: `previousPrice`, `newPrice`, `reason`), `PRESENTATION_CREATED`,
+   `PRESENTATION_UPDATED`, `PRESENTATION_DEFAULT_CHANGED`, `PRESENTATION_ACTIVATED`,
+   `PRESENTATION_DEACTIVATED`, `CATALOG_ITEM_*`.
+
+8. **`MAX_PRODUCTS` cuenta productos activos** — ver docs/05 §53 (actualizado en el mismo
+   cambio). El chequeo (`LimitService.assertWithinLimit`) corre dentro de la transacción de
+   `POST /products` y de `POST /products/:id/activate`. Productos es núcleo: no hay código de
+   `Feature` para él, así que RF-013 (feature) no aplica, solo RF-014 (límite).
+
+9. **`ProductPresentation.tenantId` desnormalizado** desde el producto, para poder ejecutar
+   consultas tenant-aware directas sobre la presentación (AGENTS.md 5) sin un join a `products`.
+
+10. **`onDelete`**: `Restrict` hacia `Tenant`, `Category`, `Brand`, `Unit` y `Product` (nada de
+    catálogo se borra físicamente — RN-010). `TenantProductSequence` usa `Cascade` (es
+    configuración, no historial). `AuditLog.user` usa `SetNull`.
+
+## 45.2 Inconsistencias detectadas en la documentación (RN-101, no se perpetúan)
+
+- **`INVENTORY_MANAGER` no puede activar/desactivar productos.** RP-015 lo define como
+  "responsable de inventario y productos", pero RP-016 solo le da `products.read/create/update`.
+  El módulo respeta la lista literal de docs/03; `products.activate` / `products.deactivate` /
+  `manage_units` / `manage_presentations` / `change_price` quedan solo para OWNER y MANAGER.
+- **`products.activate` no tiene flujo ni RF documentado.** docs/05 solo describe §14
+  "desactivar producto"; docs/06 solo RF-056. Aquí `POST /products/:id/activate` re-aplica el
+  chequeo de `MAX_PRODUCTS` (la reactivación consume plaza), regla que ningún documento
+  explicita pero que se deduce de §53.
+- **Un producto puede crearse sin presentaciones** (RF-050 no exige ninguna). Se permite; el
+  producto no tiene precio vendible hasta que se le añade al menos una presentación. La primera
+  que se añada nace principal.
+- **`barcode` único con múltiples NULL**: `@@unique([tenantId, barcode])` — Postgres trata los
+  NULL como distintos, así que varios productos sin código de barras no colisionan (mismo
+  patrón que `SaaSPayment.reference`, verificado por los tests e2e).
+
+## 45.3 Endpoints y permisos
+
+```text
+GET    /products                                     products.read
+POST   /products                                     products.create
+GET    /products/:id                                 products.read
+PATCH  /products/:id                                  products.update
+POST   /products/:id/activate                        products.activate
+POST   /products/:id/deactivate                      products.deactivate
+GET    /products/:id/presentations                   products.read
+POST   /products/:id/presentations                   products.manage_presentations
+PATCH  /products/:id/presentations/:pid              products.manage_presentations
+POST   /products/:id/presentations/:pid/price        products.change_price
+POST   /products/:id/presentations/:pid/set-default  products.manage_presentations
+POST   /products/:id/presentations/:pid/activate     products.manage_presentations
+POST   /products/:id/presentations/:pid/deactivate   products.manage_presentations
+GET    /categories | /brands                         products.read
+POST   /categories | /brands                         products.create
+PATCH  /categories/:id | /brands/:id (+ activate/deactivate)   products.update
+GET    /units                                        products.read
+POST   /units  (+ PATCH, activate, deactivate)       products.manage_units
+```
+
+No hay `DELETE` en ninguna ruta (RN-010; `products.delete` no existe — §44.2).
+`PATCH /presentations/:pid` **no** cambia el precio: para eso está el endpoint dedicado
+`/price`, que es lo que hace efectivo `products.change_price` (docs/05 §12, RP-026).
+
+## 45.4 Códigos de error nuevos
+
+`apps/api/src/common/errors.ts`: `PRODUCT_CODE_TAKEN`, `PRODUCT_BARCODE_TAKEN` (409),
+`CATALOG_NAME_TAKEN` (409), `CATALOG_IN_USE` (409, no se desactiva un catálogo referenciado por
+productos activos), `INVALID_PRESENTATION` (422), `BUSINESS_RULE_VIOLATION` (422). Nuevas clases
+atajo `NotFoundException` (404) y `BusinessRuleException` (422). Un recurso de otro tenant
+devuelve **404**, no 403 — no filtra su existencia.

@@ -33,6 +33,7 @@ import { FEATURE_CATALOG, FEATURE_CODES } from '../apps/api/src/authz/feature-co
 import { PERMISSION_CATALOG } from '../apps/api/src/authz/permissions.catalog.js';
 import { PLAN_LIMIT_KEYS } from '../apps/api/src/authz/plan-limits.js';
 import { SYSTEM_ROLE_TEMPLATE_LIST } from '../apps/api/src/authz/role-templates.js';
+import { DEFAULT_TENANT_UNITS } from '../apps/api/src/catalog/unit-catalog.js';
 import { PrismaClient } from '../apps/api/src/generated/prisma/client.js';
 
 const connectionString = process.env.DATABASE_URL;
@@ -154,7 +155,7 @@ async function seedPlatformAdmin(): Promise<void> {
  * incompleto). La auditoria de la creacion va en la misma transaccion
  * (docs/05 1782-1802).
  */
-async function seedDevTenant(planId: string): Promise<void> {
+async function seedDevTenant(planId: string): Promise<string> {
   const tenantName = requireEnv('DEV_TENANT_NAME');
   const ownerEmail = requireEnv('DEV_TENANT_OWNER_EMAIL');
   const ownerName = process.env.DEV_TENANT_OWNER_NAME ?? 'Owner';
@@ -162,10 +163,10 @@ async function seedDevTenant(planId: string): Promise<void> {
   const existing = await prisma.tenant.findFirst({ where: { name: tenantName } });
   if (existing) {
     console.log(`  tenant demo: ${tenantName} (ya existe, sin cambios)`);
-    return;
+    return existing.id;
   }
 
-  await prisma.$transaction(async (tx) => {
+  return prisma.$transaction(async (tx) => {
     const tenant = await tx.tenant.create({
       data: { name: tenantName, status: 'ACTIVE', baseCurrency: 'HNL' },
     });
@@ -252,7 +253,123 @@ async function seedDevTenant(planId: string): Promise<void> {
     console.log(
       `  tenant demo: ${tenantName} + owner ${ownerEmail} + ${SYSTEM_ROLE_TEMPLATE_LIST.length} roles + suscripcion ACTIVE`,
     );
+
+    return tenant.id;
   });
+}
+
+/**
+ * Catalogo de productos del tenant demo (Fase 4). Idempotente: unidades por
+ * defecto (D1: tenant-owned), secuencia de codigo interno y unos pocos productos
+ * de ejemplo con sus presentaciones.
+ */
+async function seedDevProducts(tenantId: string): Promise<void> {
+  for (const unit of DEFAULT_TENANT_UNITS) {
+    await prisma.unit.upsert({
+      where: { tenantId_code: { tenantId, code: unit.code } },
+      create: { tenantId, code: unit.code, name: unit.name, symbol: unit.symbol },
+      update: { name: unit.name, symbol: unit.symbol },
+    });
+  }
+
+  await prisma.tenantProductSequence.upsert({
+    where: { tenantId },
+    create: { tenantId, prefix: 'FER', nextValue: 3 },
+    update: {},
+  });
+
+  const unitByCode = new Map(
+    (await prisma.unit.findMany({ where: { tenantId } })).map((u) => [u.code, u.id] as const),
+  );
+  const libra = unitByCode.get('LIBRA');
+  const unidad = unitByCode.get('UNIDAD');
+  const quintal = unitByCode.get('QUINTAL');
+  if (!libra || !unidad || !quintal) {
+    throw new Error('Faltan unidades por defecto del tenant demo');
+  }
+
+  const construccion = await prisma.category.upsert({
+    where: { tenantId_name: { tenantId, name: 'Construccion' } },
+    create: { tenantId, name: 'Construccion' },
+    update: {},
+  });
+  const herramientas = await prisma.category.upsert({
+    where: { tenantId_name: { tenantId, name: 'Herramientas' } },
+    create: { tenantId, name: 'Herramientas' },
+    update: {},
+  });
+  const truper = await prisma.brand.upsert({
+    where: { tenantId_name: { tenantId, name: 'Truper' } },
+    create: { tenantId, name: 'Truper' },
+    update: {},
+  });
+
+  const cemento = await prisma.product.upsert({
+    where: { tenantId_internalCode: { tenantId, internalCode: 'FER-000001' } },
+    create: {
+      tenantId,
+      internalCode: 'FER-000001',
+      name: 'Cemento gris ASTM C-150',
+      categoryId: construccion.id,
+      baseUnitId: libra,
+    },
+    update: {},
+  });
+  await prisma.productPresentation.upsert({
+    where: { productId_name: { productId: cemento.id, name: 'Libra' } },
+    create: {
+      tenantId,
+      productId: cemento.id,
+      unitId: libra,
+      name: 'Libra',
+      conversionFactor: '1',
+      salePrice: '5.0000',
+      isDefault: true,
+    },
+    update: {},
+  });
+  await prisma.productPresentation.upsert({
+    where: { productId_name: { productId: cemento.id, name: 'Bolsa 42.5 kg' } },
+    create: {
+      tenantId,
+      productId: cemento.id,
+      unitId: quintal,
+      name: 'Bolsa 42.5 kg',
+      conversionFactor: '93.696',
+      salePrice: '245.0000',
+      isDefault: false,
+    },
+    update: {},
+  });
+
+  const martillo = await prisma.product.upsert({
+    where: { tenantId_internalCode: { tenantId, internalCode: 'FER-000002' } },
+    create: {
+      tenantId,
+      internalCode: 'FER-000002',
+      barcode: '7501234567890',
+      name: 'Martillo de una',
+      categoryId: herramientas.id,
+      brandId: truper.id,
+      baseUnitId: unidad,
+    },
+    update: {},
+  });
+  await prisma.productPresentation.upsert({
+    where: { productId_name: { productId: martillo.id, name: 'Unidad' } },
+    create: {
+      tenantId,
+      productId: martillo.id,
+      unitId: unidad,
+      name: 'Unidad',
+      conversionFactor: '1',
+      salePrice: '189.0000',
+      isDefault: true,
+    },
+    update: {},
+  });
+
+  console.log('  catalogo demo: 10 unidades, 2 categorias, 1 marca, 2 productos');
 }
 
 async function seedDevelopment(): Promise<void> {
@@ -262,7 +379,8 @@ async function seedDevelopment(): Promise<void> {
   }
   await seedPlatformAdmin();
   const planId = await seedDevPlan();
-  await seedDevTenant(planId);
+  const tenantId = await seedDevTenant(planId);
+  await seedDevProducts(tenantId);
 
   // Credenciales de desarrollo (idempotente: no pisa contrasenas existentes).
   await ensureDevPassword(requireEnv('PLATFORM_ADMIN_EMAIL'), DEV_ADMIN_PASSWORD);

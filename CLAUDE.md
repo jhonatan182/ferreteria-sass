@@ -59,20 +59,34 @@ apps/
                   decoradores (@Public, @PlatformAdminOnly, @TenantOptional,
                   @RequirePermissions, @CurrentUser/@CurrentContext).
                   Decisiones: docs/07 §43
-  api/src/common/ filtro global de errores + catálogo `ERROR_CODES`
+  api/src/common/ filtro global de errores + catálogo `ERROR_CODES` +
+                  `prisma-error.ts` (detección estructural de P2002, no `instanceof`)
   api/src/roles/  `GET /api/roles` (permiso `roles.read`), tenant-scoped
+  api/src/catalog/ `unit-catalog.ts`: unidades por defecto de un tenant nuevo
+  api/src/audit/  fase 4: `AuditLog` operativo append-only. `AuditService.record`
+                  escribe DENTRO de la transacción de la operación auditada.
+                  `AuditModule` es `@Global`
+  api/src/products/ fase 4: catálogo comercial. Product, ProductPresentation,
+                  Category, Brand, Unit (tenant-owned). Sin existencias ni costo.
+                  `ProductCodeService` genera `internalCode` con contador por
+                  tenant + `UPDATE ... RETURNING` (concurrencia-seguro).
+                  Decisiones: docs/04 §45
 packages/
   config/      tsconfig / prettier / oxlint compartidos             -> @ferreteria/config
   types/       contratos de tipos, sin runtime                      -> @ferreteria/types
   validation/  esquemas zod runtime (uuid, dinero, cantidad, ...)    -> @ferreteria/validation
 prisma/
-  schema.prisma   15 modelos: fundación SaaS e identidad (User, Tenant,
-                  TenantMembership, Role, Permission, RolePermission, Plan,
-                  Feature, PlanFeature, PlanLimit, Subscription,
-                  SubscriptionPeriod, SaaSPayment, PlatformAuditLog) +
-                  Session (fase 3: sesión opaca, token SHA-256, activeTenantId)
+  schema.prisma   fundación SaaS e identidad (User, Tenant, TenantMembership,
+                  Role, Permission, RolePermission, Plan, Feature, PlanFeature,
+                  PlanLimit, Subscription, SubscriptionPeriod, SaaSPayment,
+                  PlatformAuditLog) + Session (fase 3) +
+                  fase 4: Unit, Category, Brand, Product, ProductPresentation,
+                  TenantProductSequence, AuditLog (operativo). Enum CatalogStatus.
+                  Índice único parcial `product_one_default_presentation`
+                  (a mano en la migración)
   seed.ts         catálogo de plataforma (todo entorno) + datos de desarrollo
-                  (incluye contraseñas dev, solo fuera de producción)
+                  (unidades por defecto, secuencia y productos demo del tenant;
+                  contraseñas dev solo fuera de producción)
   migrations/     migraciones versionadas
 prisma.config.ts  configuración del CLI de Prisma 7 (la conexión de PrismaClient
                   usa un driver adapter en apps/api/src/prisma/prisma.service.ts)
