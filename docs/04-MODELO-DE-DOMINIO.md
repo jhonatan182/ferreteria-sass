@@ -2382,3 +2382,149 @@ la transacción. Es el ejemplo canónico de AGENTS.md §26 / docs/07 §24.
 `PRODUCT_COST_CHANGED` (entityType `Product`). Ambos son ejemplos literales de la sección 25.
 El `InventoryMovement` es trazabilidad operacional; el `AuditLog` cubre además la acción
 administrativa. Ambos se escriben dentro de la misma transacción que la operación (docs/05 §56).
+
+---
+
+# 47. Apéndice — Decisiones de implementación (Fase 6: proveedores y compras)
+
+Esta fase materializó `Supplier`, `Purchase`, `PurchaseItem` y el enum
+`PurchaseStatus` (sección 39, bloque *Compras*). Backend en
+`apps/api/src/suppliers/` y `apps/api/src/purchases/`; frontend en
+`apps/web/src/app/app/proveedores/` y `.../compras/`. **No** se implementaron
+ventas, clientes, caja, créditos ni reportes.
+
+## 47.1 Reutilización de inventario (sin duplicar lógica)
+
+`CompletePurchaseUseCase` **no reimplementa** stock ni costo: llama a
+`InventoryService.increaseWithinTx` (Fase 5) dentro de su propia transacción
+grande. Ese primitivo hace `ensureBalance` -> `SELECT ... FOR UPDATE` ->
+`computeWeightedAverage` -> actualizar balance -> crear `InventoryMovement`
+(docs/04 §46 D5/D6, docs/07 §17-19). La cancelación llama a
+`decreaseWithinTx` (type `REVERSAL`, `unitCost` nulo: no toca el costo).
+`apps/api/src/purchases/purchases.core.ts` solo aporta las reglas puras
+específicas de compra (conversión de línea, totales de cabecera).
+
+## 47.2 Decisiones sobre puntos abiertos (RN-101)
+
+1. **`Supplier.isActive` (booleano), no `status` enum** (D1). El prompt de la
+   fase lo pidió explícito; el resto del catálogo tenant-owned usa
+   `CatalogStatus`, pero un proveedor solo tiene dos estados y nunca participa
+   en cálculos. Sin borrado físico (RF-072): `deactivate` marca
+   `is_active = false`. `POST /suppliers/:id/activate` reutiliza el permiso
+   `suppliers.deactivate` (no existe `suppliers.activate` en docs/03; mismo
+   precedente que Category/Brand con `products.update`, §45.3).
+
+2. **`@@unique([tenantId, name])` en `Supplier`** (D2). La documentación no lo
+   pedía. Se añade por integridad de datos (mismo patrón que Category/Brand);
+   `name` es no nulo, sin problema de NULLs. Código de error
+   `SUPPLIER_NAME_TAKEN` (409).
+
+3. **Nombres de actores en `Purchase`** (D3): `createdByUserId`,
+   `completedByUserId`, `cancelledByUserId` (fieles al prompt). `onDelete`:
+   `Restrict` en `createdBy`; `SetNull` en los dos nullables.
+
+4. **Semántica de `PurchaseItem.unitCost`** (D4). Es el costo de **una unidad
+   capturada**: si la línea usa presentación, el costo de la presentación
+   completa (p. ej. L 250 por bolsa de 50 lb); si no, el costo por unidad base.
+   Antes de tocar inventario el backend calcula
+   `unitBaseCost = unitCost / conversionFactor` (250 / 50 = L 5 / lb) y **ese**
+   valor alimenta el promedio ponderado. `PurchaseItem` guarda ambos
+   (`unitCost`, `unitBaseCost`) más `conversionFactor` y `baseQuantity`
+   congelados al completar, para no depender del catálogo actual después
+   (docs/04 950-953).
+
+5. **Totales — el backend es la autoridad** (D5, AGENTS.md 18, RF-082). El DTO
+   **no acepta** `subtotal` ni `total` (con `forbidNonWhitelisted` enviarlos es
+   400). `discount` y `tax` son de cabecera y entran del cliente (no hay tasa
+   fija — docs/04 §29). `subtotal = suma de subtotales de línea`;
+   `total = subtotal - discount + tax`; se rechaza `total < 0`
+   (`BUSINESS_RULE_VIOLATION`). Todo se recalcula al completar a partir de los
+   items persistidos.
+
+6. **Escalas decimales** (D6): `Purchase.{subtotal,discount,tax,total}` y
+   `PurchaseItem.{quantity,baseQuantity,subtotal}` = `Decimal(18,4)`;
+   `PurchaseItem.{conversionFactor,unitCost,unitBaseCost}` = `Decimal(18,6)`
+   (coherente con `ProductPresentation.conversionFactor` e
+   `InventoryBalance.averageCost`). Cantidades y dinero viajan como **cadena**
+   en la API (AGENTS.md 11-12).
+
+7. **`documentNumber` único por tenant** (D7).
+   `@@unique([tenantId, documentNumber])`; Postgres permite múltiples NULL
+   (mismo patrón que `Product.barcode`). Cumple docs/04 1352-1368. Código
+   `PURCHASE_DOCUMENT_TAKEN` (409).
+
+8. **Producto inactivo en una compra** (D8). RN-009: un producto inactivo no
+   admite nuevas operaciones. `resolveItems` exige `status = ACTIVE` **tanto al
+   crear/editar el borrador como al completar**. Si un producto se desactiva
+   entre el borrador y la finalización, completar falla con
+   `INVALID_PURCHASE_ITEM` (422) y hace rollback total.
+
+9. **Doble finalización / doble cancelación** (D9, RF-171, AGENTS.md 10, 21).
+   `complete` y `cancel` abren transacción y hacen
+   `SELECT id, status FROM purchases ... FOR UPDATE` (`lockPurchaseWithinTx`,
+   mismo patrón que `lockBalanceWithinTx`). El estado se valida **dentro** de
+   la transacción: una segunda petición concurrente espera al COMMIT de la
+   primera, lee `COMPLETED`/`CANCELLED` y recibe 409
+   (`PURCHASE_NOT_DRAFT` / `PURCHASE_NOT_COMPLETED`). Ninguna entrada de
+   inventario se aplica dos veces.
+
+10. **Política de costo al cancelar** (D10). docs/05 §19 pedía "recalcular costo
+    según política definida" sin definirla. **Definición V1** (fiel al prompt):
+    la cancelación es una **salida compensatoria** (`REVERSAL`) que reduce la
+    cantidad y **no** recalcula retrospectivamente el `averageCost` de las
+    operaciones posteriores. El movimiento guarda el `averageCost` vigente como
+    snapshot. Si tras la compra hubo otras entradas con distinto costo, el
+    promedio queda aproximado hasta que una operación futura lo reajuste; se
+    prioriza integridad y trazabilidad sobre exactitud retroactiva (docs/02
+    §22-23). docs/05 §19 se actualiza en el mismo cambio.
+
+11. **Cancelación que dejaría stock negativo** (D11). Antes de revertir, cada
+    línea intenta `decreaseWithinTx`; si `resultingQuantity < 0` el primitivo
+    lanza `INSUFFICIENT_STOCK` y se traduce a
+    `PURCHASE_CANCELLATION_STOCK_CONFLICT` (422). **No se inventa stock
+    negativo**: la compra sigue `COMPLETED`, no hay cambios, y el mensaje pide
+    resolver la situación con los flujos de inventario apropiados (ejemplo del
+    prompt: compra +100, venta 90, cancelar requeriría -100).
+
+12. **Sin `Feature` ni límite de plan** (D12). Compras es núcleo, igual que
+    productos e inventario. Solo permisos:
+    `suppliers.{read,create,update,deactivate}`,
+    `purchases.{read,create,update,complete,cancel}` (docs/03 509-549). No se
+    tocaron las plantillas de rol: `PURCHASES_MANAGER` ya trae todo menos
+    `purchases.cancel` y `suppliers.deactivate` (docs/03 §18); `MANAGER` y
+    `OWNER` los tienen.
+
+13. **Auditoría** (D13). `PURCHASE_COMPLETED` y `PURCHASE_CANCELLED` se escriben
+    dentro de la transacción de su operación (docs/05 §56; RF-140 exige auditar
+    "compra cancelada"). También se auditan `PURCHASE_CREATED` /
+    `PURCHASE_UPDATED` y `SUPPLIER_CREATED/UPDATED/ACTIVATED/DEACTIVATED` por
+    consistencia con Productos. El `InventoryMovement` es la trazabilidad
+    operacional (`referenceType = 'PURCHASE'`, `referenceId = purchaseId`).
+
+## 47.3 Endpoints y permisos
+
+```text
+GET    /suppliers                  suppliers.read
+POST   /suppliers                  suppliers.create
+GET    /suppliers/:id              suppliers.read
+PATCH  /suppliers/:id              suppliers.update
+POST   /suppliers/:id/deactivate   suppliers.deactivate
+POST   /suppliers/:id/activate     suppliers.deactivate
+
+GET    /purchases                  purchases.read      (paginación, from/to, supplierId, status, search por documento)
+POST   /purchases                  purchases.create    (nace DRAFT)
+GET    /purchases/:id              purchases.read
+PATCH  /purchases/:id              purchases.update    (solo DRAFT; reemplaza items)
+POST   /purchases/:id/complete     purchases.complete
+POST   /purchases/:id/cancel       purchases.cancel    (motivo obligatorio)
+```
+
+Un recurso de otro tenant devuelve **404** (no filtra su existencia).
+
+## 47.4 Códigos de error nuevos
+
+`apps/api/src/common/errors.ts`: `SUPPLIER_NAME_TAKEN` (409),
+`SUPPLIER_INACTIVE` (422), `PURCHASE_NOT_DRAFT` (409),
+`PURCHASE_NOT_COMPLETED` (409), `PURCHASE_EMPTY` (422),
+`INVALID_PURCHASE_ITEM` (422), `PURCHASE_CANCELLATION_STOCK_CONFLICT` (422),
+`PURCHASE_DOCUMENT_TAKEN` (409).

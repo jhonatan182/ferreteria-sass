@@ -562,6 +562,21 @@ Si falla una operación:
 ROLLBACK
 ```
 
+**Decisión (Fase 6, docs/04 §47):** `POST /purchases/:id/complete` (permiso
+`purchases.complete`). Toda la secuencia en una transacción:
+`SELECT ... FOR UPDATE` de la compra + validar `DRAFT` (idempotencia, RF-171);
+validar proveedor activo (`SUPPLIER_INACTIVE`) y que haya items (`PURCHASE_EMPTY`);
+re-resolver cada línea contra el catálogo actual (producto/presentación activos,
+`INVALID_PURCHASE_ITEM`); convertir a unidad base
+(`baseQuantity = quantity * conversionFactor`) y a costo por unidad base
+(`unitBaseCost = unitCost / conversionFactor`); congelar esos valores en el
+`PurchaseItem`; por cada línea `InventoryService.increaseWithinTx` (movimiento
+`PURCHASE` + promedio ponderado, `referenceType = PURCHASE`); recalcular
+`subtotal` y `total` en backend a partir de los items; marcar `COMPLETED` con
+`completedByUserId` / `completedAt`; `AuditLog` `PURCHASE_COMPLETED`. Cualquier
+fallo hace rollback total. Una compra `COMPLETED` no puede volver a editarse
+como borrador (RF-083): las correcciones van por cancelación.
+
 ---
 
 # 18. Flujo: compra pagada
@@ -627,6 +642,29 @@ COMMIT
 ```
 
 La compra original permanece almacenada.
+
+**Decisión (Fase 6, docs/04 §47 D10/D11):** implementado como
+`POST /purchases/:id/cancel` (permiso `purchases.cancel`, motivo obligatorio).
+Dentro de una transacción: `SELECT ... FOR UPDATE` de la compra + validar
+`status = COMPLETED` (idempotencia frente a doble cancelación, RF-171); por cada
+línea una salida compensatoria `InventoryMovement` de tipo `REVERSAL`
+(`referenceType = PURCHASE`, `referenceId = purchaseId`) vía
+`InventoryService.decreaseWithinTx`; marcar `CANCELLED` con
+`cancelledByUserId` / `cancelledAt` / `cancellationReason`; `AuditLog`
+`PURCHASE_CANCELLED`.
+
+- **Costo:** la cancelación V1 **no** recalcula retrospectivamente el
+  `averageCost` de las operaciones posteriores a la compra. Es una salida
+  compensatoria que solo reduce cantidad; el movimiento guarda el `averageCost`
+  vigente como snapshot. Se prioriza integridad y trazabilidad sobre exactitud
+  retroactiva (docs/02 §22-23).
+- **Consistencia:** si revertir dejaría la existencia negativa (p. ej. compra
+  +100, luego se vendieron 90, stock 10, cancelar requeriría −100), la operación
+  se **rechaza** con `PURCHASE_CANCELLATION_STOCK_CONFLICT` (422). No se inventa
+  stock negativo; la compra sigue `COMPLETED` y la situación debe resolverse con
+  los flujos de inventario apropiados.
+- No hay efectos financieros que revertir en esta fase (cuentas por pagar y caja
+  de compras están fuera de V1, docs/04 §16).
 
 ---
 

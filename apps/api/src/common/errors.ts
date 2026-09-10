@@ -36,6 +36,22 @@ export const ERROR_CODES = {
   /// Una salida o ajuste negativo dejaria stock < 0 (RN-022, RF-064).
   /// La validacion definitiva ocurre DENTRO de la transaccion (docs/07 348-368).
   INSUFFICIENT_STOCK: 'INSUFFICIENT_STOCK',
+  // --- Dominio: proveedores y compras (Fase 6) --------------------------
+  SUPPLIER_NAME_TAKEN: 'SUPPLIER_NAME_TAKEN',
+  /// El proveedor de la compra esta inactivo: no admite nuevas operaciones (RN-009 analogo).
+  SUPPLIER_INACTIVE: 'SUPPLIER_INACTIVE',
+  /// Se intento editar/completar una compra que ya no esta en DRAFT (RF-083).
+  PURCHASE_NOT_DRAFT: 'PURCHASE_NOT_DRAFT',
+  /// Se intento cancelar una compra que no esta COMPLETED (o ya fue cancelada).
+  PURCHASE_NOT_COMPLETED: 'PURCHASE_NOT_COMPLETED',
+  /// No se puede completar una compra sin items.
+  PURCHASE_EMPTY: 'PURCHASE_EMPTY',
+  /// Item de compra invalido: producto/presentacion inexistente, inactivo o de otro tenant.
+  INVALID_PURCHASE_ITEM: 'INVALID_PURCHASE_ITEM',
+  /// La reversion de la cancelacion dejaria la existencia negativa (docs/05 589-627).
+  PURCHASE_CANCELLATION_STOCK_CONFLICT: 'PURCHASE_CANCELLATION_STOCK_CONFLICT',
+  /// documentNumber de compra repetido en el tenant.
+  PURCHASE_DOCUMENT_TAKEN: 'PURCHASE_DOCUMENT_TAKEN',
   // --- Genericos ---------------------------------------------------------
   VALIDATION_ERROR: 'VALIDATION_ERROR',
   BUSINESS_RULE_VIOLATION: 'BUSINESS_RULE_VIOLATION',

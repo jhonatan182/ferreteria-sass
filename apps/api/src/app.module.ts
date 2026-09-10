@@ -9,7 +9,9 @@ import { HealthModule } from './health/health.module.js';
 import { InventoryModule } from './inventory/inventory.module.js';
 import { PrismaModule } from './prisma/prisma.module.js';
 import { ProductsModule } from './products/products.module.js';
+import { PurchasesModule } from './purchases/purchases.module.js';
 import { RolesModule } from './roles/roles.module.js';
+import { SuppliersModule } from './suppliers/suppliers.module.js';
 
 // .env vive en la raiz del monorepo. Tanto en src/ como en dist/ este archivo
 // esta a tres niveles de la raiz (apps/api/src | apps/api/dist).
@@ -21,9 +23,10 @@ const rootEnv = fileURLToPath(new URL('../../../.env', import.meta.url));
  * Infraestructura (configuracion, base de datos, healthcheck) + fase 3:
  * autenticacion, contexto de tenant y autorizacion base (`AuthModule`,
  * `RolesModule`) + fase 4: catalogo de productos (`ProductsModule`,
- * `AuditModule`) + fase 5: inventario (`InventoryModule`). Los modulos de dominio
- * restantes (tenants, users, purchases, sales, credits, cash, reports) llegan en
- * fases posteriores (docs/07-ARQUITECTURA-TECNICA.md 3).
+ * `AuditModule`) + fase 5: inventario (`InventoryModule`) + fase 6: proveedores y
+ * compras (`SuppliersModule`, `PurchasesModule`). Los modulos de dominio
+ * restantes (tenants, users, sales, credits, cash, reports) llegan en fases
+ * posteriores (docs/07-ARQUITECTURA-TECNICA.md 3).
  */
 @Module({
   imports: [
@@ -37,6 +40,8 @@ const rootEnv = fileURLToPath(new URL('../../../.env', import.meta.url));
     HealthModule,
     ProductsModule,
     InventoryModule,
+    SuppliersModule,
+    PurchasesModule,
     RolesModule,
   ],
 })

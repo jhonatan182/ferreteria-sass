@@ -16,8 +16,12 @@
 //   InventoryBalance, InventoryMovement, InventoryAdjustment
 //   Enums InventoryMovementType, InventoryAdjustmentDirection
 //
+// Fase 6 — Proveedores y compras (docs/04 767-841, decisiones en docs/04 seccion 47):
+//   Supplier, Purchase, PurchaseItem
+//   Enum PurchaseStatus. Completar/cancelar compra reutiliza InventoryService.
+//
 // Fuera de alcance (fases posteriores, cada una con su migracion — AGENTS.md 22):
-//   compras, ventas, clientes, proveedores, caja, creditos, reportes.
+//   ventas, clientes, caja, creditos, reportes.
 //
 // Reglas al modelar (docs/07-ARQUITECTURA-TECNICA.md 10-13, 233-257):
 //   - IDs = UUID
@@ -128,6 +132,18 @@ enum InventoryAdjustmentDirection {
   @@map("inventory_adjustment_direction")
 }
 
+/// Estado de una compra (Fase 6; docs/04 813-819, docs/05 459-630, RN-027).
+///   DRAFT     — no afecta inventario, costo ni saldos financieros (RN-028)
+///   COMPLETED — efectos aplicados en una sola transaccion (RN-029, docs/07 308-322)
+///   CANCELLED — la compra se conserva; se generan movimientos compensatorios (RN-030)
+enum PurchaseStatus {
+  DRAFT
+  COMPLETED
+  CANCELLED
+
+  @@map("purchase_status")
+}
+
 // ---------------------------------------------------------------------------
 // Identidad
 // ---------------------------------------------------------------------------
@@ -158,6 +174,9 @@ model User {
   inventoryMovements           InventoryMovement[]
   inventoryAdjustmentsCreated  InventoryAdjustment[] @relation("InventoryAdjustmentCreatedBy")
   inventoryAdjustmentsApproved InventoryAdjustment[] @relation("InventoryAdjustmentApprovedBy")
+  purchasesCreated             Purchase[]            @relation("PurchaseCreatedBy")
+  purchasesCompleted           Purchase[]            @relation("PurchaseCompletedBy")
+  purchasesCancelled           Purchase[]            @relation("PurchaseCancelledBy")
 
   @@unique([email])
   @@index([status])
@@ -199,6 +218,9 @@ model Tenant {
   inventoryBalances    InventoryBalance[]
   inventoryMovements   InventoryMovement[]
   inventoryAdjustments InventoryAdjustment[]
+  suppliers            Supplier[]
+  purchases            Purchase[]
+  purchaseItems        PurchaseItem[]
 
   @@index([status])
   @@index([identificationNumber])
@@ -542,6 +564,7 @@ model Unit {
   baseUnitOfProducts Product[]             @relation("ProductBaseUnit")
   presentations      ProductPresentation[]
   inventoryMovements InventoryMovement[]
+  purchaseItems      PurchaseItem[]
 
   @@unique([tenantId, code])
   @@index([tenantId, status])
@@ -611,6 +634,7 @@ model Product {
   inventoryBalances    InventoryBalance[]
   inventoryMovements   InventoryMovement[]
   inventoryAdjustments InventoryAdjustment[]
+  purchaseItems        PurchaseItem[]
 
   /// Postgres trata los NULL como distintos: varios productos sin barcode no
   /// colisionan (mismo comportamiento que SaaSPayment.reference, docs/07 246-257).
@@ -643,9 +667,10 @@ model ProductPresentation {
   createdAt        DateTime      @default(now()) @map("created_at")
   updatedAt        DateTime      @updatedAt @map("updated_at")
 
-  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  product Product @relation(fields: [productId], references: [id], onDelete: Restrict)
-  unit    Unit    @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  product       Product        @relation(fields: [productId], references: [id], onDelete: Restrict)
+  unit          Unit           @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  purchaseItems PurchaseItem[]
 
   @@unique([productId, name])
   @@index([tenantId, productId, status])
@@ -812,4 +837,123 @@ model InventoryAdjustment {
   @@index([tenantId, productId, createdAt])
   @@index([tenantId, createdAt])
   @@map("inventory_adjustments")
+}
+
+// ---------------------------------------------------------------------------
+// Proveedores y compras (Fase 6)
+// ---------------------------------------------------------------------------
+//
+// docs/04 767-843, docs/05 459-630, docs/06 290-353, docs/02 347-393.
+// docs/07 308-322 (CompletePurchaseUseCase, todo en transaccion),
+// docs/07 348-368 (concurrencia por row lock, reutilizada de inventario),
+// docs/07 383-404 (costo promedio ponderado dentro de la transaccion).
+// Decisiones que la documentacion no cerraba: docs/04 seccion 47.
+//
+// La entrada de inventario y el recalculo del costo NO se reimplementan aqui:
+// `CompletePurchaseUseCase` reutiliza `InventoryService.increaseWithinTx`
+// (docs/04 seccion 46 D5/D6). La cancelacion usa `decreaseWithinTx` como salida
+// compensatoria (type REVERSAL) y NO recalcula retrospectivamente el promedio
+// (politica V1, docs/04 seccion 47).
+
+/// Proveedor de la ferreteria (docs/04 767-785, RN-002, RF-070..RF-072). TENANT-OWNED.
+/// Sin borrado fisico si tiene historial (RF-072, RN-010): se desactiva (`isActive`).
+model Supplier {
+  id             String   @id @default(uuid()) @db.Uuid
+  tenantId       String   @map("tenant_id") @db.Uuid
+  name           String
+  identification String?
+  phone          String?
+  email          String?
+  address        String?
+  isActive       Boolean  @default(true) @map("is_active")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  tenant    Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  purchases Purchase[]
+
+  /// Un nombre de proveedor no se repite dentro del tenant (decision Fase 6,
+  /// docs/04 seccion 47): mismo patron que Category/Brand. Postgres exige el
+  /// nombre no nulo, asi que no hay problema de NULLs multiples.
+  @@unique([tenantId, name])
+  @@index([tenantId, isActive])
+  @@map("suppliers")
+}
+
+/// Compra a un proveedor (docs/04 789-819, RF-080..RF-084).
+/// TENANT-OWNED. Los totales se RECALCULAN SIEMPRE en backend al completar
+/// (AGENTS.md 18, RF-082): `discount` y `tax` son de cabecera y entran del
+/// cliente; `subtotal` y `total` los fija el backend a partir de los items
+/// persistidos. `documentNumber` es unico por tenant cuando existe (RN, docs/04
+/// 1352-1368); Postgres permite multiples NULL.
+model Purchase {
+  id                 String         @id @default(uuid()) @db.Uuid
+  tenantId           String         @map("tenant_id") @db.Uuid
+  supplierId         String         @map("supplier_id") @db.Uuid
+  status             PurchaseStatus @default(DRAFT)
+  purchaseDate       DateTime       @map("purchase_date")
+  documentNumber     String?        @map("document_number")
+  subtotal           Decimal        @default(0) @db.Decimal(18, 4)
+  discount           Decimal        @default(0) @db.Decimal(18, 4)
+  tax                Decimal        @default(0) @db.Decimal(18, 4)
+  total              Decimal        @default(0) @db.Decimal(18, 4)
+  notes              String?
+  createdByUserId    String         @map("created_by_user_id") @db.Uuid
+  completedByUserId  String?        @map("completed_by_user_id") @db.Uuid
+  completedAt        DateTime?      @map("completed_at")
+  cancelledByUserId  String?        @map("cancelled_by_user_id") @db.Uuid
+  cancelledAt        DateTime?      @map("cancelled_at")
+  cancellationReason String?        @map("cancellation_reason")
+  createdAt          DateTime       @default(now()) @map("created_at")
+  updatedAt          DateTime       @updatedAt @map("updated_at")
+
+  tenant      Tenant         @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  supplier    Supplier       @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  createdBy   User           @relation("PurchaseCreatedBy", fields: [createdByUserId], references: [id], onDelete: Restrict)
+  completedBy User?          @relation("PurchaseCompletedBy", fields: [completedByUserId], references: [id], onDelete: SetNull)
+  cancelledBy User?          @relation("PurchaseCancelledBy", fields: [cancelledByUserId], references: [id], onDelete: SetNull)
+  items       PurchaseItem[]
+
+  @@unique([tenantId, documentNumber])
+  @@index([tenantId, status])
+  @@index([tenantId, supplierId])
+  @@index([tenantId, purchaseDate])
+  @@map("purchases")
+}
+
+/// Linea de una compra (docs/04 823-841). Conserva la informacion historica
+/// suficiente para no depender del costo/precio actual del producto despues
+/// (docs/04 950-953, prompt Fase 6):
+///   quantity          — capturada en la unidad de `presentation` (o la unidad base)
+///   conversionFactor  — hacia la unidad base, congelado al completar
+///   baseQuantity      — quantity * conversionFactor (lo que entra al inventario)
+///   unitCost          — costo de UNA unidad capturada (por presentacion o base)
+///   unitBaseCost      — unitCost / conversionFactor (costo por unidad base; alimenta
+///                       el promedio ponderado)
+///   subtotal          — quantity * unitCost
+model PurchaseItem {
+  id               String   @id @default(uuid()) @db.Uuid
+  tenantId         String   @map("tenant_id") @db.Uuid
+  purchaseId       String   @map("purchase_id") @db.Uuid
+  productId        String   @map("product_id") @db.Uuid
+  presentationId   String?  @map("presentation_id") @db.Uuid
+  unitId           String   @map("unit_id") @db.Uuid
+  quantity         Decimal  @db.Decimal(18, 4)
+  conversionFactor Decimal  @map("conversion_factor") @db.Decimal(18, 6)
+  baseQuantity     Decimal  @map("base_quantity") @db.Decimal(18, 4)
+  unitCost         Decimal  @map("unit_cost") @db.Decimal(18, 6)
+  unitBaseCost     Decimal  @map("unit_base_cost") @db.Decimal(18, 6)
+  subtotal         Decimal  @db.Decimal(18, 4)
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  tenant       Tenant               @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  purchase     Purchase             @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+  product      Product              @relation(fields: [productId], references: [id], onDelete: Restrict)
+  presentation ProductPresentation? @relation(fields: [presentationId], references: [id], onDelete: Restrict)
+  unit         Unit                 @relation(fields: [unitId], references: [id], onDelete: Restrict)
+
+  @@index([purchaseId])
+  @@index([tenantId, productId])
+  @@map("purchase_items")
 }

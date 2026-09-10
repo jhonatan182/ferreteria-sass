@@ -80,6 +80,17 @@ apps/
                   Ventas los consuman. `averageCost` = fuente de verdad del costo.
                   Consulta de existencia, kardex, ajustes manuales, cambio manual
                   de costo (`products.change_cost`). Decisiones: docs/04 §46
+  api/src/suppliers/ fase 6: proveedores. Supplier (tenant-owned, `isActive`,
+                  sin borrado fisico). CRUD + activate/deactivate.
+  api/src/purchases/ fase 6: compras. Supplier/Purchase/PurchaseItem. Compra en
+                  DRAFT (no toca inventario) -> `complete` (transaccional:
+                  reutiliza `InventoryService.increaseWithinTx` = entrada +
+                  promedio ponderado; recalcula totales en backend; `SELECT ...
+                  FOR UPDATE` de la compra para idempotencia) -> `cancel`
+                  (salida compensatoria `REVERSAL`; rechaza si dejaria stock
+                  negativo; NO recalcula el promedio retroactivamente).
+                  `purchases.core.ts`: reglas puras (`computeItemAmounts`,
+                  `computePurchaseTotals`). Decisiones: docs/04 §47
 packages/
   config/      tsconfig / prettier / oxlint compartidos             -> @ferreteria/config
   types/       contratos de tipos, sin runtime                      -> @ferreteria/types
@@ -96,6 +107,9 @@ prisma/
                   fase 5: InventoryBalance (`@@unique([tenantId, productId])`),
                   InventoryMovement (append-only), InventoryAdjustment.
                   Enums InventoryMovementType, InventoryAdjustmentDirection
+                  fase 6: Supplier (`@@unique([tenantId, name])`), Purchase
+                  (`@@unique([tenantId, documentNumber])`), PurchaseItem.
+                  Enum PurchaseStatus (DRAFT/COMPLETED/CANCELLED)
   seed.ts         catálogo de plataforma (todo entorno) + datos de desarrollo
                   (unidades por defecto, secuencia y productos demo del tenant;
                   contraseñas dev solo fuera de producción)

@@ -397,6 +397,26 @@ async function seedDevProducts(tenantId: string): Promise<void> {
   );
 }
 
+/**
+ * Proveedores del tenant demo (Fase 6). Idempotente por (tenantId, name).
+ * No se siembra ninguna compra: la existencia inicial ya la fija
+ * `seedOpeningStock`; una compra demo la duplicaria.
+ */
+async function seedDevSuppliers(tenantId: string): Promise<void> {
+  const suppliers = [
+    { name: 'Distribuidora El Constructor', phone: '2550-1234', email: 'ventas@elconstructor.hn' },
+    { name: 'Ferrocentro Mayorista', phone: '2557-8899', email: 'pedidos@ferrocentro.hn' },
+  ];
+  for (const supplier of suppliers) {
+    await prisma.supplier.upsert({
+      where: { tenantId_name: { tenantId, name: supplier.name } },
+      create: { tenantId, name: supplier.name, phone: supplier.phone, email: supplier.email },
+      update: {},
+    });
+  }
+  console.log(`  proveedores demo: ${suppliers.length}`);
+}
+
 /** Registra existencia inicial de un producto demo si aun no tiene. Solo desarrollo. */
 async function seedOpeningStock(
   tenantId: string,
@@ -436,6 +456,7 @@ async function seedDevelopment(): Promise<void> {
   const planId = await seedDevPlan();
   const tenantId = await seedDevTenant(planId);
   await seedDevProducts(tenantId);
+  await seedDevSuppliers(tenantId);
 
   // Credenciales de desarrollo (idempotente: no pisa contrasenas existentes).
   await ensureDevPassword(requireEnv('PLATFORM_ADMIN_EMAIL'), DEV_ADMIN_PASSWORD);
