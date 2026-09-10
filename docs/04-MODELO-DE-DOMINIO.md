@@ -2258,3 +2258,127 @@ No hay `DELETE` en ninguna ruta (RN-010; `products.delete` no existe — §44.2)
 productos activos), `INVALID_PRESENTATION` (422), `BUSINESS_RULE_VIOLATION` (422). Nuevas clases
 atajo `NotFoundException` (404) y `BusinessRuleException` (422). Un recurso de otro tenant
 devuelve **404**, no 403 — no filtra su existencia.
+
+---
+
+# 46. Apéndice — Decisiones de implementación (Fase 5: inventario)
+
+Esta fase materializó `InventoryBalance`, `InventoryMovement` e `InventoryAdjustment`
+(sección 39, bloque *Inventario*) más los enums `InventoryMovementType` e
+`InventoryAdjustmentDirection`. Backend en `apps/api/src/inventory/`; frontend en
+`apps/web/src/app/app/inventario/`. **No** se implementaron compras, ventas, clientes,
+proveedores, caja, créditos ni reportes completos. `Purchase` / `Sale` no existen todavía.
+
+## 46.1 Fuente de verdad y materialización
+
+- `InventoryMovement` = historial **append-only** (sin `updatedAt`, sin update ni delete
+  desde la aplicación; las correcciones son movimientos compensatorios — AGENTS.md §15-16).
+- `InventoryBalance` = estado actual materializado. `quantity` **nunca** se fija desde un
+  CRUD ni desde el frontend (RN-024, MD-006): solo cambia a través de una operación de
+  dominio que genera un `InventoryMovement`. No hay ninguna ruta `PATCH`/`PUT` de inventario.
+- El inventario se almacena **exclusivamente en la unidad base** del producto (RN-014). Las
+  operaciones futuras con presentaciones convertirán antes con `toBaseQuantity(quantity,
+  conversionFactor)` (`apps/api/src/inventory/inventory.core.ts`).
+
+## 46.2 Decisiones sobre puntos abiertos (RN-101)
+
+1. **Tipos de movimiento** (D1). Los ejemplos de la sección 11.2 no eran un catálogo
+   cerrado. `InventoryMovementType` fija: `PURCHASE`, `SALE`, `RETURN_IN`, `RETURN_OUT`,
+   `ADJUSTMENT_IN`, `ADJUSTMENT_OUT`, `REVERSAL`. `RETURN_IN` = devolución de venta que
+   entra a inventario (el ejemplo `SALE_RETURN`); `RETURN_OUT` = devolución a proveedor que
+   sale (`PURCHASE_RETURN`); `REVERSAL` = reverso de una operación completada (cancelación
+   de venta/compra). En esta fase solo se producen `ADJUSTMENT_IN` / `ADJUSTMENT_OUT`.
+
+2. **Escalas decimales** (D2). `InventoryBalance.quantity` = `Decimal(18,4)`;
+   `InventoryBalance.averageCost` = `Decimal(18,6)`; `InventoryMovement.quantity` /
+   `baseQuantity` / `previousQuantity` / `resultingQuantity` = `Decimal(18,4)`;
+   `InventoryMovement.unitCost` = `Decimal(18,6)?`. Cierra el pendiente de la sección 28
+   para inventario. 4 decimales de cantidad coinciden con `QUANTITY_PATTERN`
+   (`@ferreteria/validation`); 6 de costo dan holgura para cadenas de promedio ponderado
+   (el ejemplo `L. 10.6667` de la sección 13 tiene 4). En la API las cantidades y el dinero
+   viajan como **cadena** normalizada (sin ceros de relleno), nunca `number` (AGENTS.md §11-12).
+
+3. **`baseQuantity` con signo** (D3). El movimiento guarda el efecto sobre el inventario
+   con signo: positivo entra, negativo sale. `previousQuantity` y `resultingQuantity` son
+   snapshots del saldo en unidad base antes y después — el kardex reconstruye "cómo se
+   llegó al saldo actual" (RN-025) sin recomputar.
+
+4. **`InventoryBalance` — restricción y creación** (D4). `@@unique([tenantId, productId])`
+   (como máximo un balance por producto y tenant para V1). Se crea:
+   - de forma **anticipada** dentro de la transacción de `POST /products`
+     (`ProductsService.create` → `InventoryService.ensureBalanceWithinTx`), fiel al flujo
+     docs/05 §9 ("Crear InventoryBalance inicial = 0");
+   - de forma **perezosa** en cualquier operación de dominio, con
+     `INSERT ... ON CONFLICT DO NOTHING` (mismo patrón que `TenantProductSequence`), lo que
+     cubre los productos de la Fase 4 y el seed.
+
+5. **Concurrencia** (D5). `InventoryService` (vía `recordMovementWithinTx`):
+   1. `ensureBalanceWithinTx`; 2. `SELECT ... FOR UPDATE` de la fila del balance **dentro de
+   la transacción**; 3. calcular saldo resultante; 4. **rechazar si quedaría < 0**
+   (`INSUFFICIENT_STOCK`, 422); 5. recalcular costo si la entrada trae costo; 6. actualizar
+   balance; 7. registrar el movimiento. El bloqueo pesimista serializa a los concurrentes:
+   el segundo `SELECT ... FOR UPDATE` espera al COMMIT del primero y lee el saldo ya
+   actualizado (docs/07 §17). Test de concurrencia real en `test/inventory.e2e-spec.ts`.
+   Esta lógica está **centralizada**: Compras y Ventas la reutilizarán
+   (`increaseWithinTx` / `decreaseWithinTx` / `adjustWithinTx`) en su propia transacción
+   grande, sin reimplementar stock.
+
+6. **`averageCost` es la fuente de verdad del costo** (D6). `Product` **no** tiene ningún
+   campo de costo (decisión §45 D4). En Compras, `computeWeightedAverage(prevQty, prevAvg,
+   inQty, inCost)` (`inventory.core.ts`, docs/07 §19: `prevQty <= 0` ⇒ `inCost`) se aplicará
+   **dentro de la transacción** de completar la compra pasando `unitCost` a
+   `increaseWithinTx`. La infraestructura ya existe y está probada.
+
+7. **Un ajuste NO toca `averageCost`** (D7). El ajuste corrige cantidad, no valoración. El
+   `InventoryMovement` del ajuste guarda el `averageCost` vigente como `unitCost` (snapshot
+   de trazabilidad). `ADJUSTMENT_OUT` tampoco cambia el costo.
+
+8. **Cambio manual de costo: implementado** (D8). `POST /inventory/products/:id/cost`,
+   permiso `products.change_cost` (RP-025). Como Compras aún no existe, es la única vía de
+   valorar la existencia actual. Motivo obligatorio; audita `PRODUCT_COST_CHANGED`
+   (`{ previousCost, newCost, reason }`); **no** genera movimiento ni altera la existencia;
+   es una operación de dominio, nunca un PATCH libre del balance (MD-006). El flujo
+   docs/05 §13 queda cubierto.
+
+9. **`inventory.adjust_approve` reservado** (D9). No hay flujo de doble aprobación en V1
+   (docs/03 §14). `InventoryAdjustment.approvedById` existe (nullable) para ese futuro; el
+   permiso queda en el catálogo sin endpoint. Crear un ajuste requiere solo
+   `inventory.adjust`.
+
+10. **Sin `Feature` ni límite de plan** (D10). Inventario es núcleo, igual que productos
+    (§45.8). Solo permisos: `inventory.read` (consulta), `inventory.kardex` (kardex),
+    `inventory.adjust` (ajuste), `products.change_cost` (costo). `inventory.export` queda
+    reservado.
+
+11. **`onDelete`** (D11): `Restrict` hacia `Tenant`, `Product`, `Unit` y (en
+    `InventoryAdjustment`) hacia `InventoryMovement`; `InventoryMovement.user` y
+    `InventoryAdjustment.approvedBy` no aplican `SetNull` porque `userId` de movimiento es
+    `SetNull` y `createdBy` es `Restrict` (el actor de un ajuste no se pierde).
+
+## 46.3 Endpoints y permisos
+
+```text
+GET  /inventory                                inventory.read
+GET  /inventory/products/:productId            inventory.read
+GET  /inventory/products/:productId/kardex     inventory.kardex
+POST /inventory/adjustments                    inventory.adjust
+POST /inventory/products/:productId/cost       products.change_cost
+```
+
+El listado soporta paginación, búsqueda por producto (`internalCode`/`barcode`/`name`),
+filtro de estado del producto y filtro `stock` (`all`/`with`/`without`), siempre acotado al
+tenant activo. El kardex soporta producto, rango de fechas (`from`/`to`), tipo de movimiento
+y paginación. Un producto de otro tenant devuelve **404**.
+
+## 46.4 Códigos de error nuevos
+
+`apps/api/src/common/errors.ts`: `INSUFFICIENT_STOCK` (422) — una salida o ajuste negativo
+dejaría `resultingQuantity < 0` (RN-022, RF-064); la validación definitiva ocurre dentro de
+la transacción. Es el ejemplo canónico de AGENTS.md §26 / docs/07 §24.
+
+## 46.5 Vocabulario de auditoría nuevo
+
+`apps/api/src/audit/audit-actions.ts`: `INVENTORY_ADJUSTED` (entityType `InventoryAdjustment`),
+`PRODUCT_COST_CHANGED` (entityType `Product`). Ambos son ejemplos literales de la sección 25.
+El `InventoryMovement` es trazabilidad operacional; el `AuditLog` cubre además la acción
+administrativa. Ambos se escriben dentro de la misma transacción que la operación (docs/05 §56).

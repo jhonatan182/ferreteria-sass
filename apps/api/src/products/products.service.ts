@@ -7,6 +7,7 @@ import { AUDIT_ACTIONS } from '../audit/audit-actions.js';
 import { AuditService } from '../audit/audit.service.js';
 import type { TenantContext } from '../auth/auth.types.js';
 import { LimitService } from '../auth/limit.service.js';
+import { InventoryService } from '../inventory/inventory.service.js';
 import {
   BusinessRuleException,
   ConflictException,
@@ -44,9 +45,13 @@ export class ProductsService {
     private readonly audit: AuditService,
     private readonly limits: LimitService,
     private readonly codes: ProductCodeService,
+    private readonly inventory: InventoryService,
   ) {}
 
-  async list(ctx: RequestContext, query: ListProductsQuery): Promise<Paginated<ProductListItemView>> {
+  async list(
+    ctx: RequestContext,
+    query: ListProductsQuery,
+  ): Promise<Paginated<ProductListItemView>> {
     const where: Prisma.ProductWhereInput = { tenantId: ctx.tenantId };
     if (query.status !== 'all') {
       where.status = query.status;
@@ -162,7 +167,13 @@ export class ProductsService {
             await assertCatalogRef(tx, ctx.tenantId, 'brand', dto.brandId, 'La marca');
           }
           for (const p of presentations) {
-            await assertCatalogRef(tx, ctx.tenantId, 'unit', p.unitId, 'La unidad de la presentacion');
+            await assertCatalogRef(
+              tx,
+              ctx.tenantId,
+              'unit',
+              p.unitId,
+              'La unidad de la presentacion',
+            );
           }
 
           const internalCode =
@@ -180,6 +191,11 @@ export class ProductsService {
               baseUnitId: dto.baseUnitId,
             },
           });
+
+          // Existencia inicial en cero (docs/05 278-284). El servicio de
+          // inventario tambien la crea de forma perezosa, pero crearla aqui
+          // mantiene fiel el flujo "Crear InventoryBalance inicial = 0".
+          await this.inventory.ensureBalanceWithinTx(tx, ctx.tenantId, product.id);
 
           if (presentations.length > 0) {
             const defaultIndex = resolveDefaultIndex(presentations);

@@ -35,6 +35,7 @@ import { PLAN_LIMIT_KEYS } from '../apps/api/src/authz/plan-limits.js';
 import { SYSTEM_ROLE_TEMPLATE_LIST } from '../apps/api/src/authz/role-templates.js';
 import { DEFAULT_TENANT_UNITS } from '../apps/api/src/catalog/unit-catalog.js';
 import { PrismaClient } from '../apps/api/src/generated/prisma/client.js';
+import { recordMovementWithinTx } from '../apps/api/src/inventory/inventory.core.js';
 
 const connectionString = process.env.DATABASE_URL;
 if (!connectionString) {
@@ -369,7 +370,61 @@ async function seedDevProducts(tenantId: string): Promise<void> {
     update: {},
   });
 
-  console.log('  catalogo demo: 10 unidades, 2 categorias, 1 marca, 2 productos');
+  await prisma.inventoryBalance.upsert({
+    where: { tenantId_productId: { tenantId, productId: cemento.id } },
+    create: { tenantId, productId: cemento.id },
+    update: {},
+  });
+  await prisma.inventoryBalance.upsert({
+    where: { tenantId_productId: { tenantId, productId: martillo.id } },
+    create: { tenantId, productId: martillo.id },
+    update: {},
+  });
+
+  // Existencia de apertura demo. UTILIDAD CONTROLADA SOLO PARA DESARROLLO: los
+  // flujos reales cambian la existencia mediante operaciones de dominio con
+  // movimiento (RN-019/RN-024). Aqui se usa el MISMO primitivo de dominio
+  // (`recordMovementWithinTx`) para no falsear el modelo: un ADJUSTMENT_IN con
+  // costo fija tambien el `averageCost` inicial. Idempotente: se omite si el
+  // producto ya tiene existencia.
+  const ownerEmail = requireEnv('DEV_TENANT_OWNER_EMAIL');
+  const owner = await prisma.user.findUnique({ where: { email: ownerEmail } });
+  await seedOpeningStock(tenantId, cemento.id, libra, owner?.id ?? null, '1000', '2.5000');
+  await seedOpeningStock(tenantId, martillo.id, unidad, owner?.id ?? null, '24', '95.0000');
+
+  console.log(
+    '  catalogo demo: 10 unidades, 2 categorias, 1 marca, 2 productos + existencia inicial',
+  );
+}
+
+/** Registra existencia inicial de un producto demo si aun no tiene. Solo desarrollo. */
+async function seedOpeningStock(
+  tenantId: string,
+  productId: string,
+  baseUnitId: string,
+  userId: string | null,
+  quantity: string,
+  unitCost: string,
+): Promise<void> {
+  const balance = await prisma.inventoryBalance.findUnique({
+    where: { tenantId_productId: { tenantId, productId } },
+  });
+  if (balance && balance.quantity.gt(0)) {
+    return;
+  }
+  await prisma.$transaction((tx) =>
+    recordMovementWithinTx(tx, {
+      tenantId,
+      productId,
+      type: 'ADJUSTMENT_IN',
+      quantity,
+      unitId: baseUnitId,
+      baseQuantityDelta: quantity,
+      unitCost,
+      reason: 'Existencia inicial (seed desarrollo)',
+      userId,
+    }),
+  );
 }
 
 async function seedDevelopment(): Promise<void> {

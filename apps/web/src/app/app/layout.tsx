@@ -15,6 +15,7 @@ import { useAuth } from '@/lib/auth-context';
 const NAV = [
   { href: '/app', label: 'Inicio' },
   { href: '/app/productos', label: 'Productos' },
+  { href: '/app/inventario', label: 'Inventario' },
   { href: '/app/catalogos', label: 'Catalogos' },
 ] as const;
 
@@ -56,7 +57,9 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
                 key={item.href}
                 href={item.href}
                 className={`rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
-                  active ? 'bg-accent text-accent-foreground' : 'text-muted-foreground hover:text-foreground'
+                  active
+                    ? 'bg-accent text-accent-foreground'
+                    : 'text-muted-foreground hover:text-foreground'
                 }`}
               >
                 {item.label}

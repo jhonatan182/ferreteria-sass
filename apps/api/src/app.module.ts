@@ -6,6 +6,7 @@ import { ConfigModule } from '@nestjs/config';
 import { AuditModule } from './audit/audit.module.js';
 import { AuthModule } from './auth/auth.module.js';
 import { HealthModule } from './health/health.module.js';
+import { InventoryModule } from './inventory/inventory.module.js';
 import { PrismaModule } from './prisma/prisma.module.js';
 import { ProductsModule } from './products/products.module.js';
 import { RolesModule } from './roles/roles.module.js';
@@ -20,9 +21,9 @@ const rootEnv = fileURLToPath(new URL('../../../.env', import.meta.url));
  * Infraestructura (configuracion, base de datos, healthcheck) + fase 3:
  * autenticacion, contexto de tenant y autorizacion base (`AuthModule`,
  * `RolesModule`) + fase 4: catalogo de productos (`ProductsModule`,
- * `AuditModule`). Los modulos de dominio restantes (tenants, users, inventory,
- * purchases, sales, credits, cash, reports) llegan en fases posteriores
- * (docs/07-ARQUITECTURA-TECNICA.md 3).
+ * `AuditModule`) + fase 5: inventario (`InventoryModule`). Los modulos de dominio
+ * restantes (tenants, users, purchases, sales, credits, cash, reports) llegan en
+ * fases posteriores (docs/07-ARQUITECTURA-TECNICA.md 3).
  */
 @Module({
   imports: [
@@ -35,6 +36,7 @@ const rootEnv = fileURLToPath(new URL('../../../.env', import.meta.url));
     AuthModule,
     HealthModule,
     ProductsModule,
+    InventoryModule,
     RolesModule,
   ],
 })

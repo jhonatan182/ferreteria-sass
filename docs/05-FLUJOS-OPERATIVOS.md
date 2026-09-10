@@ -416,6 +416,13 @@ El sistema deberá registrar:
 
 El cambio de costo manual no debe modificar retroactivamente el costo de ventas anteriores.
 
+**Decisión (Fase 5, docs/04 §46 D8):** implementado como `POST /inventory/products/:id/cost`
+(permiso `products.change_cost`). Fija `InventoryBalance.averageCost` —la fuente de verdad del
+costo en esta fase—, exige motivo, audita `PRODUCT_COST_CHANGED` con el costo anterior y el
+nuevo, y **no** genera movimiento de inventario ni altera la existencia. Es una operación de
+dominio, nunca un PATCH libre del balance. Cuando exista Compras, el costo promedio nacerá
+del promedio ponderado de las entradas (docs/07 §19).
+
 ---
 
 # 14. Flujo: desactivar producto
@@ -677,6 +684,15 @@ AuditLog
 ```
 
 El motivo es obligatorio para ajustes.
+
+**Decisión (Fase 5, docs/04 §46):** implementado como `POST /inventory/adjustments`
+(permiso `inventory.adjust`). El ajuste se expresa como diferencia (`direction` IN/OUT +
+`quantity` en unidad base), nunca como "stock = N". En una sola transacción crea el
+`InventoryMovement` (`ADJUSTMENT_IN` / `ADJUSTMENT_OUT`), la fila `InventoryAdjustment` y el
+`AuditLog` (`INVENTORY_ADJUSTED`). El balance se bloquea con `SELECT ... FOR UPDATE` y la
+salida que dejaría stock negativo se rechaza dentro de la transacción (`INSUFFICIENT_STOCK`).
+El costo promedio no se toca. `inventory.adjust_approve` queda reservado: no hay flujo de
+doble aprobación en V1.
 
 ---
 

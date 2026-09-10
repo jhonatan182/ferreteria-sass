@@ -12,8 +12,12 @@
 //   Unit, Category, Brand, Product, ProductPresentation, TenantProductSequence,
 //   AuditLog (operativo, append-only)
 //
+// Fase 5 — Inventario (docs/04 616-693 y 1253-1274, decisiones en docs/04 seccion 46):
+//   InventoryBalance, InventoryMovement, InventoryAdjustment
+//   Enums InventoryMovementType, InventoryAdjustmentDirection
+//
 // Fuera de alcance (fases posteriores, cada una con su migracion — AGENTS.md 22):
-//   inventario, compras, ventas, caja, creditos, reportes.
+//   compras, ventas, clientes, proveedores, caja, creditos, reportes.
 //
 // Reglas al modelar (docs/07-ARQUITECTURA-TECNICA.md 10-13, 233-257):
 //   - IDs = UUID
@@ -97,6 +101,33 @@ enum CatalogStatus {
   @@map("catalog_status")
 }
 
+/// Tipo de movimiento de inventario (Fase 5; docs/04 645-693, decisiones docs/04 seccion 46).
+/// docs/04 651-658 lista EJEMPLOS; este es el catalogo cerrado para el sistema completo.
+/// Divergencia documentada de los ejemplos:
+///   RETURN_IN   = devolucion de venta que ENTRA a inventario (ej. de docs/04: "SALE_RETURN")
+///   RETURN_OUT  = devolucion a proveedor que SALE de inventario (ej.: "PURCHASE_RETURN")
+///   REVERSAL    = reverso de una operacion completada (cancelacion de venta / compra)
+/// PURCHASE / SALE los generaran sus fases; aqui solo se producen ADJUSTMENT_IN/OUT.
+enum InventoryMovementType {
+  PURCHASE
+  SALE
+  RETURN_IN
+  RETURN_OUT
+  ADJUSTMENT_IN
+  ADJUSTMENT_OUT
+  REVERSAL
+
+  @@map("inventory_movement_type")
+}
+
+/// Direccion de un ajuste manual de inventario (docs/04 1253-1274, docs/05 626-681).
+enum InventoryAdjustmentDirection {
+  IN
+  OUT
+
+  @@map("inventory_adjustment_direction")
+}
+
 // ---------------------------------------------------------------------------
 // Identidad
 // ---------------------------------------------------------------------------
@@ -119,11 +150,14 @@ model User {
   createdAt       DateTime   @default(now()) @map("created_at")
   updatedAt       DateTime   @updatedAt @map("updated_at")
 
-  memberships          TenantMembership[]
-  sessions             Session[]
-  saasPaymentsRecorded SaaSPayment[]      @relation("SaaSPaymentRecordedBy")
-  platformAuditLogs    PlatformAuditLog[] @relation("PlatformAuditActor")
-  auditLogs            AuditLog[]
+  memberships                  TenantMembership[]
+  sessions                     Session[]
+  saasPaymentsRecorded         SaaSPayment[]         @relation("SaaSPaymentRecordedBy")
+  platformAuditLogs            PlatformAuditLog[]    @relation("PlatformAuditActor")
+  auditLogs                    AuditLog[]
+  inventoryMovements           InventoryMovement[]
+  inventoryAdjustmentsCreated  InventoryAdjustment[] @relation("InventoryAdjustmentCreatedBy")
+  inventoryAdjustmentsApproved InventoryAdjustment[] @relation("InventoryAdjustmentApprovedBy")
 
   @@unique([email])
   @@index([status])
@@ -162,6 +196,9 @@ model Tenant {
   productPresentations ProductPresentation[]
   productSequence      TenantProductSequence?
   auditLogs            AuditLog[]
+  inventoryBalances    InventoryBalance[]
+  inventoryMovements   InventoryMovement[]
+  inventoryAdjustments InventoryAdjustment[]
 
   @@index([status])
   @@index([identificationNumber])
@@ -504,6 +541,7 @@ model Unit {
   tenant             Tenant                @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   baseUnitOfProducts Product[]             @relation("ProductBaseUnit")
   presentations      ProductPresentation[]
+  inventoryMovements InventoryMovement[]
 
   @@unique([tenantId, code])
   @@index([tenantId, status])
@@ -565,11 +603,14 @@ model Product {
   createdAt    DateTime      @default(now()) @map("created_at")
   updatedAt    DateTime      @updatedAt @map("updated_at")
 
-  tenant        Tenant                @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  category      Category?             @relation(fields: [categoryId], references: [id], onDelete: Restrict)
-  brand         Brand?                @relation(fields: [brandId], references: [id], onDelete: Restrict)
-  baseUnit      Unit                  @relation("ProductBaseUnit", fields: [baseUnitId], references: [id], onDelete: Restrict)
-  presentations ProductPresentation[]
+  tenant               Tenant                @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  category             Category?             @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  brand                Brand?                @relation(fields: [brandId], references: [id], onDelete: Restrict)
+  baseUnit             Unit                  @relation("ProductBaseUnit", fields: [baseUnitId], references: [id], onDelete: Restrict)
+  presentations        ProductPresentation[]
+  inventoryBalances    InventoryBalance[]
+  inventoryMovements   InventoryMovement[]
+  inventoryAdjustments InventoryAdjustment[]
 
   /// Postgres trata los NULL como distintos: varios productos sin barcode no
   /// colisionan (mismo comportamiento que SaaSPayment.reference, docs/07 246-257).
@@ -655,4 +696,120 @@ model AuditLog {
   @@index([tenantId, entityType, entityId])
   @@index([tenantId, action, createdAt])
   @@map("audit_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Inventario (Fase 5)
+// ---------------------------------------------------------------------------
+//
+// docs/04 616-693 y 1253-1274, docs/05 626-746, docs/06 244-288, docs/02 268-345.
+// docs/07 292-406 (materializacion, concurrencia por row lock, costo promedio
+// ponderado dentro de la transaccion). Decisiones que la documentacion no
+// cerraba: docs/04 seccion 46.
+//
+// Fuente de verdad:
+//   InventoryMovement  -> historial (append-only, sin update/delete desde la app)
+//   InventoryBalance   -> estado actual materializado (nunca se fija `quantity`
+//                         desde un CRUD; solo cambia via una operacion de dominio
+//                         que genera un InventoryMovement — RN-019/RN-024, MD-006)
+//
+// El inventario se almacena EXCLUSIVAMENTE en la unidad base del producto
+// (RN-014). Las operaciones futuras con presentaciones convierten antes de
+// afectar inventario: baseQuantity = quantity * conversionFactor
+// (utilidades listas en apps/api/src/inventory/inventory.core.ts).
+
+/// Existencia actual de un producto, en unidad base (docs/04 616-643).
+/// `averageCost` es la FUENTE DE VERDAD del costo promedio ponderado del producto
+/// en esta fase (docs/04 seccion 46; Product no tiene campo de costo). Compras lo
+/// recalculara dentro de su transaccion con computeWeightedAverage.
+model InventoryBalance {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  productId   String   @map("product_id") @db.Uuid
+  quantity    Decimal  @default(0) @db.Decimal(18, 4)
+  averageCost Decimal  @default(0) @map("average_cost") @db.Decimal(18, 6)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  /// Como maximo un balance por producto y tenant para V1 (docs/04 seccion 46).
+  @@unique([tenantId, productId])
+  @@index([tenantId])
+  @@map("inventory_balances")
+}
+
+/// Movimiento que modifica inventario (docs/04 645-693, RN-019..RN-021).
+/// APPEND-ONLY: sin `updatedAt`, sin update ni delete desde la aplicacion
+/// (AGENTS.md 184-194; las correcciones son movimientos compensatorios).
+/// Referencia al documento origen con `referenceType` + `referenceId`
+/// (docs/04 695-736), no con FKs nullable por tipo de documento.
+model InventoryMovement {
+  id                String                @id @default(uuid()) @db.Uuid
+  tenantId          String                @map("tenant_id") @db.Uuid
+  productId         String                @map("product_id") @db.Uuid
+  type              InventoryMovementType
+  /// Cantidad en la unidad en que se capturo la operacion (magnitud, sin signo).
+  quantity          Decimal               @db.Decimal(18, 4)
+  /// Unidad en que se capturo. En ajustes es la unidad base del producto.
+  unitId            String                @map("unit_id") @db.Uuid
+  /// Cantidad que afecta al inventario, en unidad base y CON SIGNO:
+  /// positiva = entra, negativa = sale (docs/04 680-693).
+  baseQuantity      Decimal               @map("base_quantity") @db.Decimal(18, 4)
+  /// Saldo en unidad base antes y despues del movimiento (trazabilidad del
+  /// kardex: "como se llego al saldo actual" — RN-025, docs/05 714-744).
+  previousQuantity  Decimal               @map("previous_quantity") @db.Decimal(18, 4)
+  resultingQuantity Decimal               @map("resulting_quantity") @db.Decimal(18, 4)
+  /// Costo unitario asociado. Para movimientos sin costo propio (ajustes) se
+  /// guarda el `averageCost` vigente como snapshot (docs/04 seccion 46).
+  unitCost          Decimal?              @map("unit_cost") @db.Decimal(18, 6)
+  reason            String?
+  referenceType     String?               @map("reference_type")
+  referenceId       String?               @map("reference_id") @db.Uuid
+  /// Usuario responsable. Nullable para eventos de sistema y para no perder el
+  /// registro si el usuario se elimina fisicamente en el futuro.
+  userId            String?               @map("user_id") @db.Uuid
+  createdAt         DateTime              @default(now()) @map("created_at")
+
+  tenant     Tenant               @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  product    Product              @relation(fields: [productId], references: [id], onDelete: Restrict)
+  unit       Unit                 @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  user       User?                @relation(fields: [userId], references: [id], onDelete: SetNull)
+  adjustment InventoryAdjustment?
+
+  @@index([tenantId, productId, createdAt])
+  @@index([tenantId, type, createdAt])
+  @@index([referenceType, referenceId])
+  @@map("inventory_movements")
+}
+
+/// Ajuste manual de inventario (docs/04 1253-1274, docs/05 626-681, RP-024).
+/// Se expresa como DIFERENCIA (+/-), nunca como "stock = N". Motivo obligatorio.
+/// Genera exactamente un InventoryMovement (ADJUSTMENT_IN / ADJUSTMENT_OUT) y un
+/// AuditLog dentro de la misma transaccion.
+/// `approvedById` queda reservado para un futuro flujo de doble aprobacion
+/// (`inventory.adjust_approve`); sin uso en V1 (docs/03 493-503).
+model InventoryAdjustment {
+  id           String                       @id @default(uuid()) @db.Uuid
+  tenantId     String                       @map("tenant_id") @db.Uuid
+  productId    String                       @map("product_id") @db.Uuid
+  direction    InventoryAdjustmentDirection
+  /// Magnitud positiva del ajuste, en unidad base.
+  quantity     Decimal                      @db.Decimal(18, 4)
+  reason       String
+  movementId   String                       @unique @map("movement_id") @db.Uuid
+  createdById  String                       @map("created_by_id") @db.Uuid
+  approvedById String?                      @map("approved_by_id") @db.Uuid
+  createdAt    DateTime                     @default(now()) @map("created_at")
+
+  tenant     Tenant            @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  product    Product           @relation(fields: [productId], references: [id], onDelete: Restrict)
+  movement   InventoryMovement @relation(fields: [movementId], references: [id], onDelete: Restrict)
+  createdBy  User              @relation("InventoryAdjustmentCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  approvedBy User?             @relation("InventoryAdjustmentApprovedBy", fields: [approvedById], references: [id], onDelete: Restrict)
+
+  @@index([tenantId, productId, createdAt])
+  @@index([tenantId, createdAt])
+  @@map("inventory_adjustments")
 }

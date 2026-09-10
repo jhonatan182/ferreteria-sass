@@ -32,6 +32,10 @@ export const ERROR_CODES = {
   CATALOG_NAME_TAKEN: 'CATALOG_NAME_TAKEN',
   CATALOG_IN_USE: 'CATALOG_IN_USE',
   INVALID_PRESENTATION: 'INVALID_PRESENTATION',
+  // --- Dominio: inventario (Fase 5) -------------------------------------
+  /// Una salida o ajuste negativo dejaria stock < 0 (RN-022, RF-064).
+  /// La validacion definitiva ocurre DENTRO de la transaccion (docs/07 348-368).
+  INSUFFICIENT_STOCK: 'INSUFFICIENT_STOCK',
   // --- Genericos ---------------------------------------------------------
   VALIDATION_ERROR: 'VALIDATION_ERROR',
   BUSINESS_RULE_VIOLATION: 'BUSINESS_RULE_VIOLATION',

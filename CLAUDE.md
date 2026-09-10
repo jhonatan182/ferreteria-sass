@@ -71,6 +71,15 @@ apps/
                   `ProductCodeService` genera `internalCode` con contador por
                   tenant + `UPDATE ... RETURNING` (concurrencia-seguro).
                   Decisiones: docs/04 §45
+  api/src/inventory/ fase 5: inventario. InventoryBalance (estado materializado),
+                  InventoryMovement (historial append-only), InventoryAdjustment.
+                  `inventory.core.ts`: reglas puras reutilizables
+                  (`recordMovementWithinTx` con `SELECT ... FOR UPDATE`,
+                  `computeWeightedAverage`, `toBaseQuantity`). `InventoryService`
+                  expone `increase/decrease/adjustWithinTx` para que Compras y
+                  Ventas los consuman. `averageCost` = fuente de verdad del costo.
+                  Consulta de existencia, kardex, ajustes manuales, cambio manual
+                  de costo (`products.change_cost`). Decisiones: docs/04 §46
 packages/
   config/      tsconfig / prettier / oxlint compartidos             -> @ferreteria/config
   types/       contratos de tipos, sin runtime                      -> @ferreteria/types
@@ -84,6 +93,9 @@ prisma/
                   TenantProductSequence, AuditLog (operativo). Enum CatalogStatus.
                   Índice único parcial `product_one_default_presentation`
                   (a mano en la migración)
+                  fase 5: InventoryBalance (`@@unique([tenantId, productId])`),
+                  InventoryMovement (append-only), InventoryAdjustment.
+                  Enums InventoryMovementType, InventoryAdjustmentDirection
   seed.ts         catálogo de plataforma (todo entorno) + datos de desarrollo
                   (unidades por defecto, secuencia y productos demo del tenant;
                   contraseñas dev solo fuera de producción)

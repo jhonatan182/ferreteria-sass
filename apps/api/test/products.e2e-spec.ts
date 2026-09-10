@@ -74,7 +74,10 @@ async function seedFixture(): Promise<Ids> {
     return plan.id;
   }
 
-  async function makeTenant(suffix: string, planId: string): Promise<{ tenantId: string; unitId: string }> {
+  async function makeTenant(
+    suffix: string,
+    planId: string,
+  ): Promise<{ tenantId: string; unitId: string }> {
     const tenant = await prisma.tenant.create({
       data: { name: `${MARK}${suffix}`, status: 'ACTIVE', baseCurrency: 'HNL' },
     });
@@ -95,11 +98,7 @@ async function seedFixture(): Promise<Ids> {
     return { tenantId: tenant.id, unitId: unit.id };
   }
 
-  async function makeUser(
-    local: string,
-    tenantId: string,
-    permissions: string[],
-  ): Promise<void> {
+  async function makeUser(local: string, tenantId: string, permissions: string[]): Promise<void> {
     const role = await prisma.role.create({
       data: { tenantId, name: `${MARK}${local}`, isSystem: false },
     });
@@ -150,6 +149,10 @@ async function cleanup(): Promise<void> {
   const roleIds = roles.map((r) => r.id);
 
   await prisma.auditLog.deleteMany({ where: { tenantId: { in: tenantIds } } });
+  // El alta de producto crea un InventoryBalance (Fase 5); hay que borrarlo antes.
+  await prisma.inventoryAdjustment.deleteMany({ where: { tenantId: { in: tenantIds } } });
+  await prisma.inventoryMovement.deleteMany({ where: { tenantId: { in: tenantIds } } });
+  await prisma.inventoryBalance.deleteMany({ where: { tenantId: { in: tenantIds } } });
   await prisma.productPresentation.deleteMany({ where: { tenantId: { in: tenantIds } } });
   await prisma.product.deleteMany({ where: { tenantId: { in: tenantIds } } });
   await prisma.tenantProductSequence.deleteMany({ where: { tenantId: { in: tenantIds } } });
@@ -448,7 +451,9 @@ describe('Cambio de precio', () => {
       .send({
         name: 'Con precio',
         baseUnitId: ids.unitA,
-        presentations: [{ name: 'Unidad', unitId: ids.unitA, conversionFactor: '1', salePrice: '10.00' }],
+        presentations: [
+          { name: 'Unidad', unitId: ids.unitA, conversionFactor: '1', salePrice: '10.00' },
+        ],
       })
       .expect(201);
     const productId = created.body.id as string;
