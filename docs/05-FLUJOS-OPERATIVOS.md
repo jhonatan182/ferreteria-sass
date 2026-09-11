@@ -840,6 +840,16 @@ Todavía no se modifica:
 - caja;
 - crédito.
 
+**Decisión (Fase 7, docs/04 §48):** implementado como `POST /sales` (permiso
+`sales.create`). `customerId` es opcional en el DTO: si se omite, el backend
+resuelve el cliente general del tenant (`isGeneralCustomer = true`, único por
+tenant — §48.2 D1), así que `Sale.customerId` nunca es nulo. El precio no se
+recibe del cliente: `resolveItems` lo toma del `ProductPresentation`
+seleccionado (o su presentación por defecto activa) en el momento de guardar,
+igual al calcular la línea de una compra (docs/05 §15-17); vuelve a resolverse
+al completar, porque el precio pudo cambiar mientras la venta seguía en
+borrador.
+
 ---
 
 # 24. Flujo: validar venta
@@ -873,6 +883,13 @@ Saldo + venta <= creditLimit
 ```
 
 salvo que el usuario tenga permiso especial para exceder el límite.
+
+**Decisión (Fase 7, docs/04 §48 D8):** todas estas validaciones ocurren DENTRO
+de la transacción de `complete` (no antes, como UX preliminar únicamente —
+mismo criterio que docs/07 §17 para compras). El permiso especial para exceder
+el límite (RF-113) **no se implementa**: su código no está definido en
+docs/03 (docs/04 §44.2); exceder el límite siempre se rechaza con
+`CREDIT_LIMIT_EXCEEDED` (422).
 
 ---
 
@@ -934,6 +951,17 @@ COMMIT
 
 Todos los efectos deberán pertenecer a la misma transacción.
 
+**Decisión (Fase 7, docs/04 §48):** implementado como `POST /sales/:id/complete`
+(permiso `sales.create` — no existe `sales.complete` en docs/03, §48.2 D9).
+Orden real dentro de la única `$transaction`: `SELECT ... FOR UPDATE` de la
+venta (idempotencia) → cliente activo/items no vacíos → `resolveItems`
+autoritativo → por cada línea `InventoryService.decreaseWithinTx` (type `SALE`,
+con la protección de stock de docs/04 §46) → congelar `unitPrice`/`unitCost`/
+`unitBaseCost` en cada `SaleItem` → recalcular `subtotal`/`total` → crear
+`SalePayment` → si `CREDIT`, el efecto de crédito (§29) → marcar `COMPLETED` →
+`AuditLog SALE_COMPLETED`. No se crea `CashMovement` en esta fase (Caja no
+existe todavía — §48.2 D10); una venta `CASH` solo registra su `SalePayment`.
+
 ---
 
 # 26. Flujo: venta en efectivo
@@ -958,6 +986,13 @@ cashReceived - saleTotal = change
 
 El movimiento de caja deberá reflejar únicamente el ingreso neto correspondiente a la venta.
 
+**Decisión (Fase 7, docs/04 §48 D10):** en esta fase `CASH` solo crea
+`SalePayment(method: 'CASH', amount: total)`. No hay `CashRegister`/
+`CashSession`/`CashMovement` todavía, así que no se calcula `cashReceived` ni
+`change`, y RF-104 ("cuando exista sesión de caja aplicable") no puede
+cumplirse aún. Cuando se implemente Caja, el cambio se limita a agregar un paso
+más dentro de la misma transacción de `complete`.
+
 ---
 
 # 27. Flujo: venta con tarjeta
@@ -975,6 +1010,10 @@ No se genera ingreso físico de efectivo.
 La venta puede conservar una referencia de transacción si el negocio desea registrarla.
 
 No habrá integración con el banco o proveedor de pagos en V1.
+
+**Decisión (Fase 7, docs/04 §48 D7):** la referencia se guarda en
+`SalePayment.reference` (cadena libre, opcional). `CARD` no crea ningún efecto
+adicional a `SalePayment` — no hay `CashMovement` que afectar (§48.2 D10).
 
 ---
 
@@ -995,6 +1034,9 @@ Puede registrarse una referencia manual:
 ```text
 transferReference
 ```
+
+**Decisión (Fase 7, docs/04 §48 D7):** mismo mecanismo que tarjeta:
+`SalePayment.reference`. Sin efectos adicionales.
 
 ---
 
@@ -1032,6 +1074,16 @@ Venta crédito:  L. 1,500
 Nuevo saldo:    L. 3,500
 ```
 
+**Decisión (Fase 7, docs/04 §48 D1/D8):** "`Customer obligatorio`" se cumple en
+sentido estricto: `CREDIT` exige un cliente **específico**, y el cliente
+general (§48.2 D1) se rechaza explícitamente con `CREDIT_REQUIRES_CUSTOMER`
+(422) — no basta con que `customerId` no sea nulo, porque ahora nunca lo es.
+`CreditAccount` se crea de forma perezosa (`INSERT ... ON CONFLICT DO NOTHING`)
+la primera vez que el cliente vende al crédito, bloqueada con
+`SELECT ... FOR UPDATE` dentro de la misma transacción de la venta. Solo se
+implementó `CreditAccount`/`CreditMovement` (infraestructura mínima); los
+abonos y el estado `PARTIAL` llegan con la fase de Créditos.
+
 ---
 
 # 30. Flujo: límite de crédito
@@ -1066,6 +1118,11 @@ RECHAZADA
 ```
 
 Un usuario con permiso especial podrá autorizar una excepción si el sistema posteriormente implementa ese mecanismo.
+
+**Decisión (Fase 7, docs/04 §48 D8):** implementado literal —
+`newBalance = balance + total`; si `newBalance > creditLimit`,
+`CREDIT_LIMIT_EXCEEDED` (422) y rollback total. El permiso especial para
+exceder el límite (RF-113) no existe en el catálogo; no se implementa (§24).
 
 ---
 
@@ -1494,6 +1551,31 @@ COMMIT
 ```
 
 Las reglas exactas de cancelación y devolución deberán distinguirse para evitar duplicar reversos.
+
+**Decisión (Fase 7, docs/04 §48 D6/D12):** implementado como
+`POST /sales/:id/cancel` (permiso `sales.cancel`, motivo obligatorio — igual
+que compras, docs/05 §19). Dentro de una transacción: `SELECT ... FOR UPDATE`
+de la venta + validar `status = COMPLETED` (idempotencia frente a doble
+cancelación, RF-171 → 409 `SALE_NOT_COMPLETED`); por cada línea una entrada
+compensatoria `InventoryMovement` de tipo `REVERSAL` (`referenceType = SALE`,
+`referenceId = saleId`) vía `InventoryService.increaseWithinTx` — a diferencia
+de compras, esta entrada **nunca puede rechazarse por stock** (siempre se puede
+devolver a inventario lo que salió); si hubo pago `CREDIT`, un
+`CreditMovement(ADJUSTMENT, -total)` revierte el saldo de la cuenta
+(`CREDIT_CANCELLATION_CONFLICT` si dejaría el saldo negativo, defensivo); no
+hay caja que revertir en esta fase (§48.2 D10). Marca `CANCELLED` con
+`cancelledByUserId`/`cancelledAt`/`cancellationReason`; `AuditLog
+SALE_CANCELLED`. La venta original permanece almacenada (RN-035).
+
+- **Costo:** igual que en compras (docs/05 §19), la cancelación **no**
+  recalcula retrospectivamente el `averageCost`: la entrada compensatoria no
+  envía un costo de entrada propio, así que el movimiento solo guarda el
+  `averageCost` vigente como snapshot de trazabilidad. El costo histórico de la
+  venta original vive congelado en `SaleItem.unitCost`/`unitBaseCost`
+  (docs/04 §48.2 D5/D6) y no se toca.
+- Distinción cancelación/devolución (RF-108): las devoluciones parciales
+  (`Return`/`ReturnItems`, §40-42) quedan **fuera de esta fase** — son `SHOULD`,
+  no `MUST` — junto con `sales.refund`.
 
 ---
 

@@ -33,6 +33,7 @@ import { FEATURE_CATALOG, FEATURE_CODES } from '../apps/api/src/authz/feature-co
 import { PERMISSION_CATALOG } from '../apps/api/src/authz/permissions.catalog.js';
 import { PLAN_LIMIT_KEYS } from '../apps/api/src/authz/plan-limits.js';
 import { SYSTEM_ROLE_TEMPLATE_LIST } from '../apps/api/src/authz/role-templates.js';
+import { GENERAL_CUSTOMER_TEMPLATE } from '../apps/api/src/catalog/customer-catalog.js';
 import { DEFAULT_TENANT_UNITS } from '../apps/api/src/catalog/unit-catalog.js';
 import { PrismaClient } from '../apps/api/src/generated/prisma/client.js';
 import { recordMovementWithinTx } from '../apps/api/src/inventory/inventory.core.js';
@@ -417,6 +418,31 @@ async function seedDevSuppliers(tenantId: string): Promise<void> {
   console.log(`  proveedores demo: ${suppliers.length}`);
 }
 
+/**
+ * Clientes del tenant demo (Fase 7). Idempotente por (tenantId, name). El
+ * cliente general (RF-091, docs/04 seccion 48 D1) es obligatorio: las ventas de
+ * contado sin cliente identificado lo usan. No se siembra ninguna venta.
+ */
+async function seedDevCustomers(tenantId: string): Promise<void> {
+  await prisma.customer.upsert({
+    where: { tenantId_name: { tenantId, name: GENERAL_CUSTOMER_TEMPLATE.name } },
+    create: { tenantId, name: GENERAL_CUSTOMER_TEMPLATE.name, isGeneralCustomer: true },
+    update: { isGeneralCustomer: true },
+  });
+  const customers = [
+    { name: 'Constructora Los Pinos', phone: '2233-4455', email: 'compras@lospinos.hn' },
+    { name: 'Juan Perez', phone: '9988-7766' },
+  ];
+  for (const customer of customers) {
+    await prisma.customer.upsert({
+      where: { tenantId_name: { tenantId, name: customer.name } },
+      create: { tenantId, name: customer.name, phone: customer.phone, email: customer.email },
+      update: {},
+    });
+  }
+  console.log(`  clientes demo: 1 cliente general + ${customers.length}`);
+}
+
 /** Registra existencia inicial de un producto demo si aun no tiene. Solo desarrollo. */
 async function seedOpeningStock(
   tenantId: string,
@@ -457,6 +483,7 @@ async function seedDevelopment(): Promise<void> {
   const tenantId = await seedDevTenant(planId);
   await seedDevProducts(tenantId);
   await seedDevSuppliers(tenantId);
+  await seedDevCustomers(tenantId);
 
   // Credenciales de desarrollo (idempotente: no pisa contrasenas existentes).
   await ensureDevPassword(requireEnv('PLATFORM_ADMIN_EMAIL'), DEV_ADMIN_PASSWORD);

@@ -929,3 +929,61 @@ Se mantiene el contrato de la sección 5 sin cambios
 (`{ userId, tenantId, membershipId, roleId, permissions }`). Los datos extra
 para features/límites (`tenant`, `subscription` con su set de features y mapa de
 límites) viajan aparte en `request.tenantContext`, no en el contrato público.
+
+## 44. Decisiones de implementación — Ventas (Fase 7)
+
+Decisiones técnicas de `CompleteSaleUseCase`/`CancelSaleUseCase`
+(`apps/api/src/sales/`). Las decisiones de modelo de dominio están en docs/04
+§48; esta sección cubre solo la arquitectura de ejecución.
+
+### 44.1 Reutilización de `InventoryService` (sin reimplementar concurrencia)
+
+Igual que Compras (docs/04 §47.1), Ventas **no** reimplementa nada de stock:
+
+```text
+CompleteSaleUseCase
+  +-- lockSaleWithinTx (SELECT ... FOR UPDATE sobre sales)
+  +-- validar DRAFT (idempotencia)
+  +-- validar cliente activo / items no vacios
+  +-- resolveItems (producto+presentacion ACTIVE, precio de la BD)
+  +-- por cada linea: InventoryService.decreaseWithinTx (type SALE)
+  |     +-- ensureBalance -> SELECT ... FOR UPDATE -> rechaza si < 0
+  |     +-- INSUFFICIENT_STOCK (422) si no alcanza
+  +-- congelar unitPrice/unitCost/unitBaseCost en SaleItem
+  +-- recalcular subtotal/descuento/impuesto/total
+  +-- crear SalePayment
+  +-- si CREDIT: FeatureService.assert('CREDITS') + CreditMovement(SALE)
+  +-- marcar Sale = COMPLETED
+  +-- AuditLog (SALE_COMPLETED)
+COMMIT
+```
+
+Todo dentro de una única transacción Prisma (`$transaction`); si cualquier paso
+lanza, Postgres revierte TODO (RF-160). El `SELECT ... FOR UPDATE` del balance
+de inventario (no el de la venta) es lo que serializa a dos ventas que compiten
+por el mismo producto: la segunda espera al COMMIT de la primera, relee el
+saldo ya descontado y recibe `INSUFFICIENT_STOCK` si no alcanza — la misma
+garantía documentada en docs/07 §17-19 para Compras, sin código nuevo de
+concurrencia (AGENTS.md §21).
+
+### 44.2 Orden de autorización de una venta CREDIT
+
+Sigue AGENTS.md §6 (`Feature -> Limit -> Permission -> Resource ownership ->
+Business rules`): el guard de permisos (`sales.create`) ya corrió antes de
+llegar al servicio; dentro del servicio, `FeatureService.assert(tenantCtx,
+'CREDITS')` se evalúa **antes** de tocar inventario o crédito, para que un
+tenant sin la feature falle rápido y sin efectos parciales. El límite de
+crédito (`saldo + total <= creditLimit`) es una regla de negocio, no un
+`PlanLimit`: se valida dentro de la transacción, bloqueando la fila de
+`CreditAccount` (`SELECT ... FOR UPDATE`), igual que el balance de inventario.
+
+### 44.3 Cancelación
+
+`CancelSaleUseCase` reutiliza el mismo `lockSaleWithinTx` para la idempotencia
+(RF-171) y llama a `InventoryService.increaseWithinTx` (type `REVERSAL`) por
+cada línea. A diferencia de Compras, una entrada compensatoria de venta **nunca
+puede fallar por stock** (siempre se puede devolver a inventario lo que salió);
+si la venta fue `CREDIT`, revierte el saldo de `CreditAccount` dentro de la
+misma transacción y puede rechazar con `CREDIT_CANCELLATION_CONFLICT` si
+dejaría el saldo negativo (defensivo: no ocurre en V1 sin abonos, pero la
+cuenta queda lista para cuando existan).

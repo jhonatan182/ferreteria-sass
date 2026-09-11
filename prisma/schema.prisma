@@ -20,8 +20,14 @@
 //   Supplier, Purchase, PurchaseItem
 //   Enum PurchaseStatus. Completar/cancelar compra reutiliza InventoryService.
 //
+// Fase 7 — Clientes y ventas (docs/04 855-996, decisiones en docs/04 seccion 48):
+//   Customer, Sale, SaleItem, SalePayment + infra minima de credito
+//   (CreditAccount, CreditMovement). Enums SaleStatus, PaymentMethod,
+//   CreditMovementType, CreditAccountStatus. Completar/cancelar venta reutiliza
+//   InventoryService (type SALE / REVERSAL).
+//
 // Fuera de alcance (fases posteriores, cada una con su migracion — AGENTS.md 22):
-//   ventas, clientes, caja, creditos, reportes.
+//   caja, creditos completos (abonos/estados/cartera), reportes.
 //
 // Reglas al modelar (docs/07-ARQUITECTURA-TECNICA.md 10-13, 233-257):
 //   - IDs = UUID
@@ -144,6 +150,56 @@ enum PurchaseStatus {
   @@map("purchase_status")
 }
 
+/// Estado de una venta (Fase 7; docs/04 896-928, docs/02 406-466, RN-032).
+///   DRAFT     — no afecta inventario, caja, credito ni saldos (RN-033)
+///   COMPLETED — efectos aplicados en una sola transaccion (RN-034, docs/05 890-936)
+///   CANCELLED — la venta se conserva; se generan movimientos compensatorios (RN-036)
+enum SaleStatus {
+  DRAFT
+  COMPLETED
+  CANCELLED
+
+  @@map("sale_status")
+}
+
+/// Metodo de pago de una venta (Fase 7; docs/04 958-996, RN-037). Ampliable.
+///   CASH     — efectivo; alimentara caja cuando exista sesion aplicable (RF-104)
+///   CARD     — tarjeta; no genera efectivo fisico (RN-040)
+///   TRANSFER — transferencia; no genera efectivo fisico (RN-041)
+///   CREDIT   — venta al credito; exige cliente especifico y feature CREDITS (RF-106)
+enum PaymentMethod {
+  CASH
+  CARD
+  TRANSFER
+  CREDIT
+
+  @@map("payment_method")
+}
+
+/// Tipo de movimiento de una cuenta de credito (Fase 7 — infra minima; docs/04 1024-1060).
+///   SALE       — venta al credito: aumenta el saldo pendiente
+///   PAYMENT    — abono del cliente: reduce el saldo (endpoint en la fase de Creditos)
+///   ADJUSTMENT — correccion (p. ej. reverso por cancelacion de venta)
+enum CreditMovementType {
+  SALE
+  PAYMENT
+  ADJUSTMENT
+
+  @@map("credit_movement_type")
+}
+
+/// Estado de una cuenta de credito (RN-048..RN-050, docs/05 1180-1210).
+///   PENDING — saldo > 0 y sin abonos
+///   PARTIAL — saldo > 0 y con abonos (fase de Creditos)
+///   PAID    — saldo = 0
+enum CreditAccountStatus {
+  PENDING
+  PARTIAL
+  PAID
+
+  @@map("credit_account_status")
+}
+
 // ---------------------------------------------------------------------------
 // Identidad
 // ---------------------------------------------------------------------------
@@ -177,6 +233,10 @@ model User {
   purchasesCreated             Purchase[]            @relation("PurchaseCreatedBy")
   purchasesCompleted           Purchase[]            @relation("PurchaseCompletedBy")
   purchasesCancelled           Purchase[]            @relation("PurchaseCancelledBy")
+  salesCreated                 Sale[]                @relation("SaleCreatedBy")
+  salesCompleted               Sale[]                @relation("SaleCompletedBy")
+  salesCancelled               Sale[]                @relation("SaleCancelledBy")
+  creditMovementsCreated       CreditMovement[]      @relation("CreditMovementCreatedBy")
 
   @@unique([email])
   @@index([status])
@@ -221,6 +281,12 @@ model Tenant {
   suppliers            Supplier[]
   purchases            Purchase[]
   purchaseItems        PurchaseItem[]
+  customers            Customer[]
+  sales                Sale[]
+  saleItems            SaleItem[]
+  salePayments         SalePayment[]
+  creditAccounts       CreditAccount[]
+  creditMovements      CreditMovement[]
 
   @@index([status])
   @@index([identificationNumber])
@@ -565,6 +631,7 @@ model Unit {
   presentations      ProductPresentation[]
   inventoryMovements InventoryMovement[]
   purchaseItems      PurchaseItem[]
+  saleItems          SaleItem[]
 
   @@unique([tenantId, code])
   @@index([tenantId, status])
@@ -635,6 +702,7 @@ model Product {
   inventoryMovements   InventoryMovement[]
   inventoryAdjustments InventoryAdjustment[]
   purchaseItems        PurchaseItem[]
+  saleItems            SaleItem[]
 
   /// Postgres trata los NULL como distintos: varios productos sin barcode no
   /// colisionan (mismo comportamiento que SaaSPayment.reference, docs/07 246-257).
@@ -671,6 +739,7 @@ model ProductPresentation {
   product       Product        @relation(fields: [productId], references: [id], onDelete: Restrict)
   unit          Unit           @relation(fields: [unitId], references: [id], onDelete: Restrict)
   purchaseItems PurchaseItem[]
+  saleItems     SaleItem[]
 
   @@unique([productId, name])
   @@index([tenantId, productId, status])
@@ -956,4 +1025,209 @@ model PurchaseItem {
   @@index([purchaseId])
   @@index([tenantId, productId])
   @@map("purchase_items")
+}
+
+// ---------------------------------------------------------------------------
+// Clientes y ventas (Fase 7)
+// ---------------------------------------------------------------------------
+//
+// docs/04 855-996, docs/05 830-1010, docs/06 355-449, docs/02 396-466.
+// docs/07 300-345 (CompleteSaleUseCase, todo en transaccion),
+// docs/07 348-368 (concurrencia por row lock, reutilizada de inventario).
+// Decisiones que la documentacion no cerraba: docs/04 seccion 48.
+//
+// La salida de inventario NO se reimplementa aqui: `CompleteSaleUseCase`
+// reutiliza `InventoryService.decreaseWithinTx` (type SALE). La cancelacion usa
+// `increaseWithinTx` (type REVERSAL, `unitCost` nulo: no toca el promedio,
+// politica coherente con docs/04 seccion 47 D10). El costo historico de la venta
+// queda congelado en `SaleItem.unitCost` / `unitBaseCost` (docs/04 950-953).
+//
+// Credito: infra minima (CreditAccount / CreditMovement). Los abonos, estados
+// completos y reportes de cartera llegan en la fase de Creditos. Una venta
+// CREDIT exige la feature CREDITS y un cliente especifico (RF-092, RF-106).
+
+/// Cliente de la ferreteria (docs/04 865-891, RN-043/RN-044). TENANT-OWNED.
+/// Sin borrado fisico (RN-010): se desactiva (`isActive`).
+/// `isGeneralCustomer` marca el cliente generico para ventas de contado sin
+/// cliente identificado (RF-091). Uno solo por tenant: indice unico parcial en
+/// la migracion (customer_one_general_per_tenant), no expresable en Prisma.
+/// El cliente general no puede usarse para credito (RF-092) ni desactivarse
+/// (docs/04 seccion 48 D1).
+model Customer {
+  id                String   @id @default(uuid()) @db.Uuid
+  tenantId          String   @map("tenant_id") @db.Uuid
+  name              String
+  identification    String?
+  phone             String?
+  email             String?
+  address           String?
+  /// Limite de credito configurable (RN-051). 0 = sin credito autorizado.
+  creditLimit       Decimal  @default(0) @map("credit_limit") @db.Decimal(18, 4)
+  isGeneralCustomer Boolean  @default(false) @map("is_general_customer")
+  isActive          Boolean  @default(true) @map("is_active")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  sales         Sale[]
+  creditAccount CreditAccount?
+
+  @@unique([tenantId, name])
+  @@index([tenantId, isActive])
+  @@map("customers")
+}
+
+/// Venta (docs/04 896-928, RF-100..RF-107). TENANT-OWNED.
+/// Los totales se RECALCULAN SIEMPRE en backend al completar (AGENTS.md 18):
+/// `discount` y `tax` son de cabecera y entran del cliente; `subtotal` y `total`
+/// los fija el backend a partir de los items persistidos. El precio de cada
+/// linea se resuelve del `ProductPresentation`, nunca del frontend (docs/05
+/// 866-878). `customerId` es NOT NULL: las ventas sin cliente identificado usan
+/// el cliente general del tenant (docs/04 seccion 48 D1). `documentNumber` es
+/// unico por tenant cuando existe; sin generacion automatica en esta fase.
+model Sale {
+  id                 String     @id @default(uuid()) @db.Uuid
+  tenantId           String     @map("tenant_id") @db.Uuid
+  customerId         String     @map("customer_id") @db.Uuid
+  status             SaleStatus @default(DRAFT)
+  saleDate           DateTime   @map("sale_date")
+  documentNumber     String?    @map("document_number")
+  subtotal           Decimal    @default(0) @db.Decimal(18, 4)
+  discount           Decimal    @default(0) @db.Decimal(18, 4)
+  tax                Decimal    @default(0) @db.Decimal(18, 4)
+  total              Decimal    @default(0) @db.Decimal(18, 4)
+  notes              String?
+  createdByUserId    String     @map("created_by_user_id") @db.Uuid
+  completedByUserId  String?    @map("completed_by_user_id") @db.Uuid
+  completedAt        DateTime?  @map("completed_at")
+  cancelledByUserId  String?    @map("cancelled_by_user_id") @db.Uuid
+  cancelledAt        DateTime?  @map("cancelled_at")
+  cancellationReason String?    @map("cancellation_reason")
+  createdAt          DateTime   @default(now()) @map("created_at")
+  updatedAt          DateTime   @updatedAt @map("updated_at")
+
+  tenant      Tenant        @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  customer    Customer      @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  createdBy   User          @relation("SaleCreatedBy", fields: [createdByUserId], references: [id], onDelete: Restrict)
+  completedBy User?         @relation("SaleCompletedBy", fields: [completedByUserId], references: [id], onDelete: SetNull)
+  cancelledBy User?         @relation("SaleCancelledBy", fields: [cancelledByUserId], references: [id], onDelete: SetNull)
+  items       SaleItem[]
+  payments    SalePayment[]
+
+  @@unique([tenantId, documentNumber])
+  @@index([tenantId, status])
+  @@index([tenantId, customerId])
+  @@index([tenantId, saleDate])
+  @@map("sales")
+}
+
+/// Linea de una venta (docs/04 931-953). Conserva un snapshot historico
+/// suficiente para no depender del catalogo actual despues de completar:
+///   productName / presentationName — nombre al momento de la venta
+///   quantity          — capturada en la unidad de `presentation` (o la base)
+///   conversionFactor  — hacia la unidad base, congelado al completar
+///   baseQuantity      — quantity * conversionFactor (lo que sale del inventario)
+///   unitPrice         — precio de UNA unidad capturada, RESUELTO por el backend
+///                       del `ProductPresentation` (RN-015); nunca del frontend
+///   subtotal          — quantity * unitPrice - discount
+///   unitCost/unitBaseCost — costo promedio vigente al completar (rentabilidad
+///                       historica; NO se recalcula al variar el promedio despues
+///                       — docs/04 950-953). Nulos mientras la venta es DRAFT.
+model SaleItem {
+  id               String   @id @default(uuid()) @db.Uuid
+  tenantId         String   @map("tenant_id") @db.Uuid
+  saleId           String   @map("sale_id") @db.Uuid
+  productId        String   @map("product_id") @db.Uuid
+  presentationId   String?  @map("presentation_id") @db.Uuid
+  unitId           String   @map("unit_id") @db.Uuid
+  productName      String   @map("product_name")
+  presentationName String?  @map("presentation_name")
+  quantity         Decimal  @db.Decimal(18, 4)
+  conversionFactor Decimal  @map("conversion_factor") @db.Decimal(18, 6)
+  baseQuantity     Decimal  @map("base_quantity") @db.Decimal(18, 4)
+  unitPrice        Decimal  @map("unit_price") @db.Decimal(18, 4)
+  discount         Decimal  @default(0) @db.Decimal(18, 4)
+  subtotal         Decimal  @db.Decimal(18, 4)
+  unitCost         Decimal? @map("unit_cost") @db.Decimal(18, 6)
+  unitBaseCost     Decimal? @map("unit_base_cost") @db.Decimal(18, 6)
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  tenant       Tenant               @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  sale         Sale                 @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  product      Product              @relation(fields: [productId], references: [id], onDelete: Restrict)
+  presentation ProductPresentation? @relation(fields: [presentationId], references: [id], onDelete: Restrict)
+  unit         Unit                 @relation(fields: [unitId], references: [id], onDelete: Restrict)
+
+  @@index([saleId])
+  @@index([tenantId, productId])
+  @@map("sale_items")
+}
+
+/// Pago de una venta (docs/04 958-996, RN-037..RN-042). APPEND-ONLY.
+/// Entidad SEPARADA de Sale: en V1 una venta usa un solo metodo, pero el modelo
+/// admite varios pagos futuros sin rehacer Sale. `reference` guarda un dato de
+/// la transaccion (voucher de tarjeta, referencia de transferencia) — sin
+/// integracion bancaria en V1 (docs/05 963-975). Una venta CASH no genera aqui
+/// ningun movimiento de caja: eso lo hara la fase de Caja.
+model SalePayment {
+  id        String        @id @default(uuid()) @db.Uuid
+  tenantId  String        @map("tenant_id") @db.Uuid
+  saleId    String        @map("sale_id") @db.Uuid
+  method    PaymentMethod
+  amount    Decimal       @db.Decimal(18, 4)
+  reference String?
+  createdAt DateTime      @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  sale   Sale   @relation(fields: [saleId], references: [id], onDelete: Restrict)
+
+  @@index([saleId])
+  @@index([tenantId, method, createdAt])
+  @@map("sale_payments")
+}
+
+/// Cuenta de credito de un cliente (Fase 7 — infra minima; docs/04 1002-1020).
+/// El `balance` se materializa para rendimiento, pero los `CreditMovement` son
+/// la trazabilidad principal (AGENTS.md 13, docs/07 21). Una por cliente.
+model CreditAccount {
+  id         String              @id @default(uuid()) @db.Uuid
+  tenantId   String              @map("tenant_id") @db.Uuid
+  customerId String              @unique @map("customer_id") @db.Uuid
+  balance    Decimal             @default(0) @db.Decimal(18, 4)
+  status     CreditAccountStatus @default(PENDING)
+  createdAt  DateTime            @default(now()) @map("created_at")
+  updatedAt  DateTime            @updatedAt @map("updated_at")
+
+  tenant    Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  customer  Customer         @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  movements CreditMovement[]
+
+  @@index([tenantId])
+  @@map("credit_accounts")
+}
+
+/// Movimiento de una cuenta de credito (Fase 7 — infra minima; docs/04 1024-1060).
+/// APPEND-ONLY. `amount` con signo: + aumenta la deuda (SALE), - la reduce
+/// (PAYMENT / ADJUSTMENT por cancelacion de venta). Referencia al origen con
+/// `referenceType` + `referenceId` (docs/05 1700-1712).
+model CreditMovement {
+  id              String             @id @default(uuid()) @db.Uuid
+  tenantId        String             @map("tenant_id") @db.Uuid
+  creditAccountId String             @map("credit_account_id") @db.Uuid
+  type            CreditMovementType
+  amount          Decimal            @db.Decimal(18, 4)
+  referenceType   String?            @map("reference_type")
+  referenceId     String?            @map("reference_id") @db.Uuid
+  reason          String?
+  createdByUserId String             @map("created_by_user_id") @db.Uuid
+  createdAt       DateTime           @default(now()) @map("created_at")
+
+  tenant        Tenant        @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  creditAccount CreditAccount @relation(fields: [creditAccountId], references: [id], onDelete: Restrict)
+  createdBy     User          @relation("CreditMovementCreatedBy", fields: [createdByUserId], references: [id], onDelete: Restrict)
+
+  @@index([tenantId, creditAccountId, createdAt])
+  @@index([referenceType, referenceId])
+  @@map("credit_movements")
 }

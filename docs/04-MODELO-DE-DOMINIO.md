@@ -926,6 +926,13 @@ El cliente puede ser `null` para ventas normales sin cliente identificado.
 
 Una venta a crédito siempre deberá tener cliente.
 
+**Corrección (Fase 7, docs/04 §48 D1):** esta sección y RF-091/RF-092 entraban en
+conflicto (`customerId` nulo vs. "cliente genérico"). Se implementó el cliente
+general como una fila real de `Customer` (`isGeneralCustomer = true`, una por
+tenant), de forma que `Sale.customerId` es **NOT NULL** siempre y RF-092
+("una venta a crédito no puede asociarse al cliente general") es una regla
+comprobable en el backend. Ver §48.1 D1.
+
 ---
 
 ## 18.2 SaleItem
@@ -2528,3 +2535,228 @@ Un recurso de otro tenant devuelve **404** (no filtra su existencia).
 `PURCHASE_NOT_COMPLETED` (409), `PURCHASE_EMPTY` (422),
 `INVALID_PURCHASE_ITEM` (422), `PURCHASE_CANCELLATION_STOCK_CONFLICT` (422),
 `PURCHASE_DOCUMENT_TAKEN` (409).
+
+---
+
+# 48. Apéndice — Decisiones de implementación (Fase 7: clientes y ventas)
+
+Esta fase materializó `Customer`, `Sale`, `SaleItem`, `SalePayment` y el enum
+`SaleStatus` (sección 39, bloque *Ventas*), más la **infraestructura mínima**
+de `CreditAccount`/`CreditMovement` (sección 39, bloque *Créditos*) necesaria
+para que una venta al crédito quede correctamente identificada, sin adelantar
+el módulo completo de Créditos (cobros, estados de cartera, reportes).
+Backend en `apps/api/src/customers/` y `apps/api/src/sales/`; frontend en
+`apps/web/src/app/app/clientes/` y `.../ventas/`. **No** se implementaron caja,
+créditos completos ni reportes.
+
+## 48.1 Reutilización de inventario (sin duplicar lógica)
+
+`CompleteSaleUseCase` **no reimplementa** stock ni concurrencia: llama a
+`InventoryService.decreaseWithinTx` (Fase 5) dentro de su propia transacción
+grande. Ese primitivo hace `ensureBalance` -> `SELECT ... FOR UPDATE` ->
+rechazar si `resultingQuantity < 0` (`INSUFFICIENT_STOCK`) -> actualizar
+balance -> crear `InventoryMovement` tipo `SALE` (docs/04 §46 D5, docs/07
+§17-19, §46). La cancelación llama a `increaseWithinTx` (type `REVERSAL`, sin
+recalcular el promedio: mismo primitivo, misma política que compras — §47.1).
+`apps/api/src/sales/sales.core.ts` solo aporta las reglas puras específicas de
+venta (conversión de línea, totales de cabecera).
+
+## 48.2 Decisiones sobre puntos abiertos (RN-101)
+
+1. **Cliente general: fila real, no `customerId = null`** (D1). RF-091 dice
+   "las ventas de contado podrán utilizar un cliente genérico"; RF-092 dice
+   "una venta a crédito no podrá asociarse al cliente general". Ambas reglas
+   solo son comprobables si el cliente general es una fila identificable, así
+   que se prefirió esa lectura sobre la de §18.1 ("el cliente puede ser
+   `null`") — ver la corrección en §18.1. `Customer.isGeneralCustomer`
+   (booleano) marca la fila; único por tenant vía el índice parcial
+   `customer_one_general_per_tenant` (mismo procedimiento que
+   `product_one_default_presentation` / `subscription_one_active_per_tenant`:
+   no expresable en el schema de Prisma). `Sale.customerId` es **NOT NULL**.
+   El cliente general se crea de forma perezosa (`GET /customers/general`) si
+   el tenant aún no lo tiene — cubre tenants provisionados antes de esta fase
+   — y también lo siembra el seed de desarrollo
+   (`apps/api/src/catalog/customer-catalog.ts`, mismo patrón que
+   `unit-catalog.ts`).
+
+2. **El cliente general no se desactiva ni recibe crédito** (D2,
+   `GENERAL_CUSTOMER_PROTECTED`, 422). No está documentado explícitamente, pero
+   se sigue por integridad: desactivarlo dejaría sin cliente de contado por
+   defecto, y un límite de crédito sobre él sería indistinguible de "crédito
+   sin cliente", justo lo que RF-092 prohíbe.
+
+3. **Precio siempre resuelto del backend; sin `unitPrice` en el DTO** (D3,
+   RN-015, AGENTS.md 4/18). `SaleItemDto` solo acepta `productId`,
+   `presentationId` opcional y `quantity`: con `forbidNonWhitelisted`, enviar
+   `unitPrice` o `discount` de línea es 400. Si no se envía `presentationId`,
+   el backend usa la presentación `isDefault` activa del producto; si el
+   producto no tiene ninguna, `INVALID_SALE_ITEM` (422). El precio y el nombre
+   de producto/presentación se **congelan** en `SaleItem` al completar
+   (`productName`, `presentationName`, `unitPrice`) para no depender del
+   catálogo actual después (docs/04 950-953). El descuento o precio manual por
+   línea queda **fuera de esta fase**: exigiría un permiso propio que la
+   documentación no define (mismo criterio que RF-113, D8 más abajo); mientras
+   tanto `SaleItem.discount` existe en el esquema con `default 0` pero la API
+   no lo acepta.
+
+4. **Descuento e impuesto de cabecera** (D4, mismo patrón que compras — §47.2
+   D5). `subtotal = suma de subtotales de línea`; `total = subtotal - discount
+   + tax`; se rechaza `total < 0` (`BUSINESS_RULE_VIOLATION`). No hay tasa fija
+   de impuesto (docs/04 §29): `tax` es un monto de cabecera que entra del
+   cliente, igual que en compras.
+
+5. **Costo histórico: `unitBaseCost`/`unitCost` en `SaleItem`** (D5). El prompt
+   de la fase pedía "`averageCostAtSale` o `costSnapshot`"; se usó la misma
+   pareja que `PurchaseItem` (§47.2 D4) por consistencia: `unitBaseCost` es el
+   `InventoryBalance.averageCost` vigente **en el momento de completar**
+   (tomado del `MovementResult` que devuelve `decreaseWithinTx` — una salida
+   nunca recalcula el promedio, así que es exactamente el costo vigente) y
+   `unitCost = unitBaseCost * conversionFactor` (costo de una unidad de la
+   presentación vendida). Ambos quedan `NULL` mientras la venta es `DRAFT` y se
+   congelan al completar; una compra o ajuste posterior que mueva el promedio
+   **no** los reescribe (verificado en `sales.e2e-spec.ts`).
+
+6. **Costo al cancelar: `REVERSAL` con el promedio como snapshot, no
+   recalculado** (D6, mismo criterio que §47.2 D10 y §46 D7). La entrada
+   compensatoria de una cancelación llama a `increaseWithinTx` sin forzar un
+   costo de entrada propio: `recordMovementWithinTx` no encuentra
+   `unitCost` que recalcular, así que el `averageCost` del producto **no
+   cambia**, y el movimiento guarda el `averageCost` vigente como snapshot de
+   trazabilidad (igual que en toda entrada sin costo propio — §46 D7). El
+   costo histórico de la venta original sigue viviendo, intacto, en
+   `SaleItem.unitCost`/`unitBaseCost`.
+
+7. **`SalePayment` separado de `Sale`; regla de "pago único" en el caso de
+   uso, no en el modelo** (D7, docs/04 §19.1). El modelo admite varios pagos
+   futuros sin rehacer `Sale`; V1 solo permite completar con un pago:
+   `CompleteSaleDto.amount` es opcional y, si se envía, debe coincidir EXACTO
+   con el total recalculado (`SALE_PAYMENT_MISMATCH`, 422); si se omite, se usa
+   el total. Split payments no se implementó en la UI (fuera de alcance de
+   esta fase).
+
+8. **Venta CREDIT: infraestructura mínima de crédito, no el módulo completo**
+   (D8). RF-106/RF-112 exigen que una venta CREDIT valide el límite y genere
+   un movimiento de crédito; docs/04 §39 ya lista `CreditAccount` y
+   `CreditMovement` como entidades V1. Se implementó exactamente esa pareja
+   (sin endpoints de cobro/ajuste, que son de la fase de Créditos):
+   - la venta exige la feature de plan `CREDITS` (`FeatureService.assert`,
+     orden de AGENTS.md §6: Feature antes que la regla de negocio) y rechaza
+     el cliente general (`CREDIT_REQUIRES_CUSTOMER`, 422 — RF-092);
+   - `lockOrCreateCreditAccountWithinTx` crea la cuenta si no existe
+     (`INSERT ... ON CONFLICT DO NOTHING`, mismo patrón que
+     `ensureBalanceWithinTx`) y la bloquea (`SELECT ... FOR UPDATE`) dentro de
+     la transacción de la venta;
+   - se valida `saldo + total <= creditLimit` (RF-112) antes de crear
+     `CreditMovement(SALE, +total)` y actualizar `balance`/`status`;
+   - al cancelar, `CreditMovement(ADJUSTMENT, -total)` revierte el saldo; si
+     dejaría el saldo negativo, `CREDIT_CANCELLATION_CONFLICT` (422) — no
+     puede ocurrir en V1 porque no hay abonos todavía, pero la validación
+     queda lista para cuando existan;
+   - `CreditAccountStatus` en esta fase solo distingue `PENDING` (saldo > 0)
+     de `PAID` (saldo = 0): `PARTIAL` (con abonos) llega con el endpoint de
+     abonos.
+   - El permiso para exceder el límite de crédito (RF-113) **no se
+     implementa**: su código sigue sin definir en la documentación (§44.2);
+     exceder el límite siempre se rechaza.
+
+9. **Permiso de completar: `sales.create`, no `sales.complete`** (D9,
+   docs/05 §25 lo dice literal: "## Permiso `sales.create`"). El catálogo de
+   docs/03 §16 no tiene `sales.complete` ni `sales.update`; los 70 permisos
+   están fijados por test (`permissions.catalog.spec.ts`), así que no se
+   inventan. `PATCH /sales/:id` y `POST /sales/:id/complete` comparten
+   `sales.create`.
+
+10. **Caja: no se toca en esta fase** (D10). RF-104 condiciona el ingreso de
+    caja a que "exista sesión de caja aplicable"; RN-034/RF-102 dicen "afectar
+    caja cuando corresponda"/"si aplica". Una venta `CASH` únicamente crea su
+    `SalePayment`; no se crea `CashMovement` (el modelo de Caja — `CashRegister`
+    /`CashSession`/`CashMovement` — todavía no existe). Cuando se implemente
+    Caja, la conexión es agregar un paso más dentro de la misma transacción de
+    `complete`, sin tocar lo ya construido aquí.
+
+11. **`documentNumber` opcional, sin generación automática** (D11, mismo
+    patrón que `Purchase` — §47.2 D7). `@@unique([tenantId, documentNumber])`;
+    Postgres permite múltiples NULL. No se inventa un prefijo: docs/04 §27 y
+    §36 se contradicen entre sí (`FAC-` vs `VENT-`) y no hay todavía una
+    entidad de numeración configurable (§44.3 lo deja pendiente). Código
+    `SALE_DOCUMENT_TAKEN` (409).
+
+12. **Doble finalización / doble cancelación** (D12, RF-171, AGENTS.md §10/21,
+    mismo patrón que compras — §47.2 D9). `complete` y `cancel` hacen
+    `SELECT id, status FROM sales ... FOR UPDATE` (`lockSaleWithinTx`) y
+    validan el estado **dentro** de la transacción: una segunda petición
+    concurrente espera al COMMIT de la primera y recibe 409
+    (`SALE_NOT_DRAFT` / `SALE_NOT_COMPLETED`).
+
+13. **Sin `Feature` ni límite de plan propios de Ventas/Clientes** (D13).
+    Ventas y Clientes son núcleo, igual que Productos/Inventario/Compras.
+    Únicamente la venta CREDIT consulta la feature `CREDITS` (D8). No se
+    tocaron las plantillas de rol: `CASHIER` ya trae
+    `customers.{read,create}` y `sales.{read,create}` (docs/03 §14); `MANAGER`
+    y `OWNER` tienen el resto (`customers.update/deactivate`,
+    `sales.cancel/refund/export`).
+
+14. **Auditoría** (D14). `SALE_COMPLETED` y `SALE_CANCELLED` se escriben dentro
+    de la transacción de su operación (docs/05 §56; RF-140/RN-078 exigen
+    auditar "venta cancelada"). También se auditan `SALE_CREATED`/
+    `SALE_UPDATED` y `CUSTOMER_CREATED/UPDATED/ACTIVATED/DEACTIVATED/
+    CREDIT_LIMIT_CHANGED` por consistencia con Productos y Compras. El
+    `InventoryMovement` es la trazabilidad operacional
+    (`referenceType = 'SALE'`, `referenceId = saleId`); el `CreditMovement`
+    cumple el mismo papel para el efecto de crédito.
+
+## 48.3 Inconsistencias detectadas en la documentación (RN-101, no se perpetúan)
+
+- **`customerId` nulo (§18.1) vs. "cliente genérico" (RF-091/RF-092)**: resuelto
+  a favor de una fila real de cliente general — ver D1 y la corrección en §18.1.
+- **Prefijo de `documentNumber` de venta**: §27 usa `FAC-`, §36 usa `VENT-`. No
+  se elige ninguno; el campo queda libre hasta que se apruebe un esquema de
+  numeración (ver D11 y §44.3).
+- **`SaleItem.tax`/`total` de §18.2**: la sección lista `tax` y `total` por
+  línea, pero ninguna otra fase (incluida Compras) modela impuesto ni total por
+  línea — solo de cabecera (D4). No se implementan en `SaleItem`; el impuesto
+  vive únicamente en `Sale.tax`.
+- **`CashMovementType` `SALE`/`INCOME`**: §21.3 nombra el valor de enum `SALE`;
+  §22 y docs/05 §25/§26 lo describen como "`CashMovement(INCOME)`" en prosa. No
+  aplica todavía (D10, caja fuera de esta fase), pero queda anotado para cuando
+  se implemente Caja.
+
+## 48.4 Endpoints y permisos
+
+```text
+GET    /customers                    customers.read
+GET    /customers/general            customers.read   (cliente general; perezoso)
+POST   /customers                    customers.create
+GET    /customers/:id                customers.read
+PATCH  /customers/:id                customers.update
+POST   /customers/:id/deactivate     customers.deactivate
+POST   /customers/:id/activate       customers.deactivate
+POST   /customers/:id/credit-limit   credits.change_limit
+
+GET    /sales                  sales.read      (paginación, from/to, customerId, status, search por documento)
+POST   /sales                  sales.create    (nace DRAFT; customerId opcional -> cliente general)
+GET    /sales/:id              sales.read
+PATCH  /sales/:id              sales.create    (solo DRAFT; reemplaza items)
+POST   /sales/:id/complete     sales.create    (docs/05 §25)
+POST   /sales/:id/cancel       sales.cancel    (motivo obligatorio)
+```
+
+Un recurso de otro tenant devuelve **404** (no filtra su existencia).
+
+## 48.5 Códigos de error nuevos
+
+`apps/api/src/common/errors.ts`: `CUSTOMER_NAME_TAKEN` (409),
+`CUSTOMER_INACTIVE` (422), `GENERAL_CUSTOMER_PROTECTED` (422),
+`SALE_NOT_DRAFT` (409), `SALE_NOT_COMPLETED` (409), `SALE_EMPTY` (422),
+`INVALID_SALE_ITEM` (422), `SALE_DOCUMENT_TAKEN` (409),
+`SALE_PAYMENT_MISMATCH` (422), `CREDIT_REQUIRES_CUSTOMER` (422),
+`CREDIT_LIMIT_EXCEEDED` (422), `CREDIT_CANCELLATION_CONFLICT` (422).
+
+## 48.6 Vocabulario de auditoría nuevo
+
+`apps/api/src/audit/audit-actions.ts`: `CUSTOMER_CREATED/UPDATED/ACTIVATED/
+DEACTIVATED`, `CUSTOMER_CREDIT_LIMIT_CHANGED` (entityType `Customer`),
+`SALE_CREATED/UPDATED/COMPLETED/CANCELLED` (entityType `Sale`). El
+`InventoryMovement` y el `CreditMovement` son trazabilidad operacional; el
+`AuditLog` cubre además la acción administrativa. Todos se escriben dentro de
+la misma transacción que la operación (docs/05 §56).

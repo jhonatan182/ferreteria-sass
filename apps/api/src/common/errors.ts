@@ -52,6 +52,31 @@ export const ERROR_CODES = {
   PURCHASE_CANCELLATION_STOCK_CONFLICT: 'PURCHASE_CANCELLATION_STOCK_CONFLICT',
   /// documentNumber de compra repetido en el tenant.
   PURCHASE_DOCUMENT_TAKEN: 'PURCHASE_DOCUMENT_TAKEN',
+  // --- Dominio: clientes y ventas (Fase 7) ------------------------------
+  /// Nombre de cliente repetido en el tenant.
+  CUSTOMER_NAME_TAKEN: 'CUSTOMER_NAME_TAKEN',
+  /// El cliente de la venta esta inactivo: no admite nuevas operaciones (RN-009 analogo).
+  CUSTOMER_INACTIVE: 'CUSTOMER_INACTIVE',
+  /// Operacion no permitida sobre el cliente general (desactivar, credito, editar su marca).
+  GENERAL_CUSTOMER_PROTECTED: 'GENERAL_CUSTOMER_PROTECTED',
+  /// Se intento editar/completar una venta que ya no esta en DRAFT (RF-101).
+  SALE_NOT_DRAFT: 'SALE_NOT_DRAFT',
+  /// Se intento cancelar una venta que no esta COMPLETED (o ya fue cancelada).
+  SALE_NOT_COMPLETED: 'SALE_NOT_COMPLETED',
+  /// No se puede completar una venta sin items.
+  SALE_EMPTY: 'SALE_EMPTY',
+  /// Item de venta invalido: producto/presentacion inexistente, inactivo o de otro tenant.
+  INVALID_SALE_ITEM: 'INVALID_SALE_ITEM',
+  /// documentNumber de venta repetido en el tenant.
+  SALE_DOCUMENT_TAKEN: 'SALE_DOCUMENT_TAKEN',
+  /// El pago enviado no cuadra con el total recalculado por el backend (regla V1: pago unico).
+  SALE_PAYMENT_MISMATCH: 'SALE_PAYMENT_MISMATCH',
+  /// Una venta CREDIT exige un cliente especifico; el cliente general no sirve (RF-092).
+  CREDIT_REQUIRES_CUSTOMER: 'CREDIT_REQUIRES_CUSTOMER',
+  /// `saldo + total` excederia el limite de credito del cliente (RF-112).
+  CREDIT_LIMIT_EXCEEDED: 'CREDIT_LIMIT_EXCEEDED',
+  /// Revertir el credito de la venta dejaria el saldo de la cuenta negativo.
+  CREDIT_CANCELLATION_CONFLICT: 'CREDIT_CANCELLATION_CONFLICT',
   // --- Genericos ---------------------------------------------------------
   VALIDATION_ERROR: 'VALIDATION_ERROR',
   BUSINESS_RULE_VIOLATION: 'BUSINESS_RULE_VIOLATION',

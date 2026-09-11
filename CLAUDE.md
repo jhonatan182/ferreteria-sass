@@ -91,6 +91,26 @@ apps/
                   negativo; NO recalcula el promedio retroactivamente).
                   `purchases.core.ts`: reglas puras (`computeItemAmounts`,
                   `computePurchaseTotals`). Decisiones: docs/04 §47
+  api/src/customers/ fase 7: clientes. Customer (tenant-owned, `isActive`,
+                  `isGeneralCustomer`, `creditLimit`, sin borrado fisico). CRUD +
+                  activate/deactivate + cambio de límite de crédito
+                  (`credits.change_limit`). Cliente general único por tenant
+                  (creación perezosa vía `GET /customers/general`).
+  api/src/sales/ fase 7: ventas. Customer/Sale/SaleItem/SalePayment + infra
+                  mínima de crédito (CreditAccount/CreditMovement). Venta en
+                  DRAFT (no toca inventario/caja/crédito) -> `complete`
+                  (transaccional: precio SIEMPRE resuelto del
+                  `ProductPresentation`, nunca del frontend; reutiliza
+                  `InventoryService.decreaseWithinTx` = salida + protección de
+                  stock; congela costo histórico en `SaleItem`; si CREDIT valida
+                  límite y crea `CreditMovement`; recalcula totales en backend;
+                  `SELECT ... FOR UPDATE` de la venta para idempotencia) ->
+                  `cancel` (entrada compensatoria `REVERSAL`, nunca falla por
+                  stock; revierte crédito si aplica; NO recalcula el promedio
+                  retroactivamente). `sales.core.ts`: reglas puras
+                  (`computeSaleItemAmounts`, `computeSaleTotals`,
+                  `capturedUnitCost`). Permiso de completar: `sales.create`
+                  (no existe `sales.complete`). Decisiones: docs/04 §48
 packages/
   config/      tsconfig / prettier / oxlint compartidos             -> @ferreteria/config
   types/       contratos de tipos, sin runtime                      -> @ferreteria/types
@@ -110,6 +130,13 @@ prisma/
                   fase 6: Supplier (`@@unique([tenantId, name])`), Purchase
                   (`@@unique([tenantId, documentNumber])`), PurchaseItem.
                   Enum PurchaseStatus (DRAFT/COMPLETED/CANCELLED)
+                  fase 7: Customer (`@@unique([tenantId, name])`, índice único
+                  parcial `customer_one_general_per_tenant`), Sale
+                  (`@@unique([tenantId, documentNumber])`), SaleItem,
+                  SalePayment + infra mínima de crédito: CreditAccount
+                  (`customerId` único), CreditMovement (append-only).
+                  Enums SaleStatus, PaymentMethod, CreditMovementType,
+                  CreditAccountStatus
   seed.ts         catálogo de plataforma (todo entorno) + datos de desarrollo
                   (unidades por defecto, secuencia y productos demo del tenant;
                   contraseñas dev solo fuera de producción)
